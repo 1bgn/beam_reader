@@ -1,0 +1,39 @@
+name: beam_reader
+description: "A new Flutter project."
+
+publish_to: 'none' # Remove this line if you wish to publish to pub.dev
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.9.0
+
+
+dependencies:
+  get_it: ^8.2.0
+  injectable: ^2.5.1
+  freezed_annotation: ^3.1.0
+  xml: ^6.6.1
+  signals: ^6.0.2
+  signals_flutter: ^6.0.2
+  json_annotation: ^4.9.0
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+
+  flutter_lints: ^6.0.0
+  freezed: ^3.2.0
+  build_runner: any
+  json_serializable: any
+  injectable_generator: any
+
+
+flutter:
+
+  uses-material-design: true
+
