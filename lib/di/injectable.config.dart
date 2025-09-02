@@ -9,7 +9,6 @@
 // coverage:ignore-file
 
 // ignore_for_file: no_leading_underscores_for_library_prefixes
-import 'package:beam_reader/engine/fb2_parser.dart' as _i84;
 import 'package:beam_reader/engine/xml_loader.dart' as _i575;
 import 'package:beam_reader/features/reader_screen/appication/reader_screen_controller.dart'
     as _i917;
@@ -24,12 +23,8 @@ extension GetItInjectableX on _i174.GetIt {
   }) {
     final gh = _i526.GetItHelper(this, environment, environmentFilter);
     gh.lazySingleton<_i575.XmlLoader>(() => _i575.XmlLoader());
-    gh.lazySingleton<_i84.Fb2Parser>(() => _i84.Fb2Parser());
     gh.lazySingleton<_i917.ReaderScreenController>(
-      () => _i917.ReaderScreenController(
-        gh<_i575.XmlLoader>(),
-        gh<_i84.Fb2Parser>(),
-      ),
+      () => _i917.ReaderScreenController(gh<_i575.XmlLoader>()),
     );
     return this;
   }

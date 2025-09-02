@@ -1,5 +1,6 @@
 import 'package:beam_reader/di/injectable.dart';
 import 'package:beam_reader/features/reader_screen/appication/reader_screen_controller.dart';
+import 'package:beam_reader/features/reader_screen/presentation/reader_pager.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 
@@ -15,11 +16,19 @@ class _ReaderScreenState extends State<ReaderScreen> {
   @override
   void initState() {
     super.initState();
-    controller.start();
+    controller.buildBook();
   }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(body: Center(child: Text("Reader screen"),),);
+
+    return Scaffold(
+      body: Builder(
+        builder: (context) {
+
+          return Center();
+        }
+      ),
+    );
   }
 }
