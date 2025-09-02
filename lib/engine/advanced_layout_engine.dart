@@ -245,8 +245,8 @@ class AdvancedLayoutEngine{
     return result;
   }
   List<TextInlineElement>? _trySplitBySoftHyphen(TextInlineElement elem, double remainingWidth) {
+    // final raw = elem.text;
     final raw = hyphenator.hyphenate(elem.text);
-    // final raw = hyphenator.hyphenate(elem.text);
     final positions = <int>[];
     for (int i = 0;i<raw.length;i++){
       if(raw.codeUnitAt(i)==0x00AD){

@@ -40,7 +40,7 @@ class ReaderScreenController {
       viewportHeight: MediaQuery.of(context).size.height,
       targetPagesPerChunk: 25, // ≈ по 25 страниц
       // настройки должны совпадать с вашим рендером:
-      baseFontSize: 18,
+      baseFontSize: 14,
       lineHeight: 1.6,
       paragraphSpacing: 10,
       pagePadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 28),
