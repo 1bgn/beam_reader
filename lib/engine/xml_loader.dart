@@ -3,6 +3,6 @@ import 'package:injectable/injectable.dart';
 @LazySingleton()
 class XmlLoader {
   Future<String> loadBook()async{
-    return rootBundle.loadString("assets/books/book1.fb2");
+    return rootBundle.loadString("assets/books/book2.fb2");
   }
 }
