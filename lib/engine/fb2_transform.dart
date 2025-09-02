@@ -1,3 +1,7 @@
+import 'dart:convert';
+import 'dart:typed_data';
+import 'dart:ui' as ui;
+
 import 'package:beam_reader/engine/hyphenator.dart';
 import 'package:xml/xml.dart';
 
@@ -9,7 +13,28 @@ import 'elements/data_blocks/text_run.dart';
 // Блочные элементы: p, v, title, subtitle, text-author, etc.
 
 
+Map<String, Uint8List> extractBinaryMap(XmlDocument doc) {
+  final map = <String, Uint8List>{};
+  for (final bin in doc.findAllElements('binary')) {
+    final id = bin.getAttribute('id');
+    if (id == null) continue;
+    final base64txt = bin.innerText.trim();
+    if (base64txt.isEmpty) continue;
+    try {
+      map[id] = base64.decode(base64txt);
+    } catch (_) {
+      // игнорируем битые бинарники
+    }
+  }
+  return map;
+}
 
+/// Декодируем bytes -> ui.Image
+Future<ui.Image> decodeUiImage(Uint8List bytes) async {
+  final codec = await ui.instantiateImageCodec(bytes);
+  final frame = await codec.getNextFrame();
+  return frame.image;
+}
 /// Типизация известных блочных тегов (не обязательно — можно хранить как String)
 enum Fb2BlockTag {
   body,
@@ -63,6 +88,8 @@ Fb2BlockTag fb2BlockTagFromName(String name) {
 
 class Fb2Transformer {
   Fb2Transformer();
+
+
   static const Set<String> _blockTags = {
     'body','section','title','subtitle','p','empty-line','poem','stanza','v',
     'epigraph','annotation','cite','text-author','image','table','tr','td','th',

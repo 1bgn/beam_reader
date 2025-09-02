@@ -335,6 +335,7 @@ class AdvancedLayoutEngine{
     final out = <InlineElement>[];
 
     for (final e in elements) {
+
       if (e is! TextInlineElement) {
         out.add(e);
         continue;
