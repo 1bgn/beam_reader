@@ -45,6 +45,8 @@ BlockRenderStyle fb2BlockRenderStyle({
     case 'title': {
       final d = depth.clamp(0, 3);
       final scale = 1.35 - d * 0.10; // 1.35, 1.25, 1.15, 1.05
+      print("ferwfaaewrfewa");
+
       return BlockRenderStyle(
         textStyle: base.copyWith(
           fontSize: baseFontSize * scale,

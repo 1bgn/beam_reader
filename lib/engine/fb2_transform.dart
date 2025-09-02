@@ -31,7 +31,12 @@ enum Fb2BlockTag {
   td,
   unknown,
 }
-
+bool _isStyleContainer(String name) =>
+    name == 'title' ||
+        name == 'subtitle' ||
+        name == 'text-author' ||
+        name == 'epigraph' ||
+        name == 'cite';
 Fb2BlockTag fb2BlockTagFromName(String name) {
   switch (name) {
     case 'body': return Fb2BlockTag.body;
@@ -89,51 +94,67 @@ class Fb2Transformer {
   // ---------- Публичные ----------
   List<BlockText> parseToBlocks(XmlNode root) {
     final out = <BlockText>[];
-    _walk(root, out, path: const [], depth: 0);
+    _walk(root, out, path: const [], depth: 0, styleScope: null);
     return out;
   }
-
   List<List<InlineText>> groupIntoLines(List<BlockText> blocks) =>
       blocks.map((b) => b.inlines).toList(growable: false);
 
   // ---------- Рекурсия ----------
-  void _walk(XmlNode node, List<BlockText> sink,
-      {required List<String> path, required int depth}) {
+  void _walk(
+      XmlNode node,
+      List<BlockText> sink, {
+        required List<String> path,
+        required int depth,
+        String? styleScope,        // ← добавили
+      }) {
     if (node is XmlElement) {
       final tag = node.name.local;
 
-      // Полностью пропускаемые
       if (_skipEntirely.contains(tag)) return;
 
-      // Листовой блок (включая <title> без <p>)
-      final isTitleLeaf = tag == 'title' && !_hasChildTag(node, 'p');
-      final isLeafBlock = _leafBlocks.contains(tag) || isTitleLeaf;
+      // определяем "стилистический контекст" для детей
+      final nextStyleScope = _isStyleContainer(tag) ? tag : styleScope;
 
-      if (isLeafBlock) {
-        sink.add(_buildLeafBlock(node, path: [...path, tag], depth: depth));
+      // листовой блок? (p, v, subtitle, text-author, empty-line, image, td, th)
+      final isLeafBlock = _leafBlocks.contains(tag);
+
+      // отдельно: <title> без <p> тоже считаем листом (редко, но бывает)
+      final isTitleLeaf = tag == 'title' && !_hasChildTag(node, 'p');
+
+      if (isLeafBlock || isTitleLeaf) {
+        sink.add(_buildLeafBlock(
+          node,
+          path: [...path, tag],
+          depth: depth,
+          overrideTag: styleScope,     // ← КЛЮЧ: подменяем на стиль родителя, если есть
+        ));
         return;
       }
 
-      // Для всех остальных элементов — ВСЕГДА спускаемся в детей
-      // (даже если это "неизвестные" контейнеры типа <FictionBook>, <description>, и т. п.)
+      // увеличиваем глубину для этих структур (как у тебя было)
       final nextDepth = (tag == 'section' || tag == 'poem' || tag == 'stanza' || tag == 'epigraph' || tag == 'cite')
           ? depth + 1
           : depth;
 
       for (final child in node.children) {
-        _walk(child, sink, path: [...path, tag], depth: nextDepth);
+        _walk(child, sink, path: [...path, tag], depth: nextDepth, styleScope: nextStyleScope);
       }
       return;
     }
-
-    // Текстовые узлы вне явных листовых блоков обычно — переносы/пробелы, игнорируем.
-    // Если хочешь собирать «голый» текст на верхнем уровне, можно добавить синтетический <p> тут.
+    // … остальное без изменений
   }
 
-  BlockText _buildLeafBlock(XmlElement el, {required List<String> path, required int depth}) {
-    final tag = el.name.local;
+  BlockText _buildLeafBlock(
+      XmlElement el, {
+        required List<String> path,
+        required int depth,
+        String? overrideTag,              // ← добавили
+      }) {
+    final rawTag = el.name.local;
+    final tag = overrideTag ?? rawTag; // ← если пришёл стиль родителя — используем его
 
-    if (tag == 'empty-line') {
+    if (rawTag == 'empty-line') {
       return BlockText(
         tag: 'empty-line',
         id: _nextId('empty-line', path),
@@ -142,8 +163,7 @@ class Fb2Transformer {
         depth: depth,
       );
     }
-
-    if (tag == 'image') {
+    if (rawTag == 'image') {
       return BlockText(
         tag: 'image',
         id: _nextId('image', path),
@@ -154,10 +174,9 @@ class Fb2Transformer {
       );
     }
 
-    // Листовые: собираем инлайны
     final inlines = _parseInlineChildren(el, path: path);
     return BlockText(
-      tag: tag,
+      tag: tag,                        // ← теперь заголовочные p станут 'title' и т.п.
       id: _nextId(tag, path),
       inlines: _coalesceTextRuns(inlines),
       path: path,
@@ -165,6 +184,9 @@ class Fb2Transformer {
       attrs: _attrsOf(el),
     );
   }
+
+
+
 
   List<InlineText> _parseInlineChildren(XmlElement parent, {required List<String> path}) {
     final out = <InlineText>[];
