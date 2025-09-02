@@ -46,13 +46,17 @@ class ReaderScreenController {
       pagePadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 28),
     );
     final AdvancedLayoutEngine advancedLayoutEngine = AdvancedLayoutEngine(
+      allowSoftHyphens: true,
       paragraphs: blocks.sublist(chunks.first.blockStart, chunks.first.blockEnd).map((e)=>e.inlines)
           .map(
             (e) => ParagraphBlock(
+              textAlign: TextAlign.justify,
               inlineElements: e
                   .map(
                     (e) => TextInlineElement(
+
                       text: (e is TextRun) ? e.text : "",
+
                       style: TextStyle(color: Colors.black),
                     ),
                   )
@@ -61,7 +65,7 @@ class ReaderScreenController {
           )
           .toList(),
       globalMaxWidth: MediaQuery.of(context).size.width,
-      globalTextAlign: TextAlign.left,
+      globalTextAlign: TextAlign.justify,
     );
     print("lines ${advancedLayoutEngine.paragraphs}");
    CustomTextLayout customTextLayout =  advancedLayoutEngine.layoutAllParagraphs();

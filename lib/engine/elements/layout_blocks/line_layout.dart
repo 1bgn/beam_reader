@@ -8,12 +8,13 @@ class LineLayout {
   double height = 0;
   double maxAscent = 0;
   double maxDescent = 0;
-  bool isSectionEnd = false;
+  bool isSectionEnd = false;      // последняя строка абзаца
+  bool endsWithHardBreak = false; // закончилась явным \n
+  int  spacesCount = 0;           // количество обычных пробелов ' ' в строке
   TextAlign textAlign = TextAlign.left;
   TextDirection textDirection = TextDirection.ltr;
-  // Новое свойство для хранения коэффициента контейнерного смещения
   double containerOffset = 0;
-  double containerOffsetFactor = 1.0; // По умолчанию 1.0 (то есть весь доступный width)
+  double containerOffsetFactor = 1.0;
   int startTextOffset = 0;
   double get baseline => maxAscent;
 }

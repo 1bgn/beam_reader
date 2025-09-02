@@ -32,7 +32,11 @@ class _ReaderScreenState extends State<ReaderScreen> {
             if (controller.textLayout.value != null) {
               return SingleChildScrollView(
                 child: Column(
-                  children: [SinglePageView(page: buildPage(controller.textLayout.value!), lineSpacing: 0, allowSoftHyphens: true)],),
+                  children: [Row(
+                    children: [
+                      SinglePageView(page: buildPage(controller.textLayout.value!), lineSpacing: 0, allowSoftHyphens: true),
+                    ],
+                  )],),
               );
             }
             return Center();
