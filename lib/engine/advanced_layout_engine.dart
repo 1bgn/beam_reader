@@ -6,6 +6,7 @@ import 'package:beam_reader/engine/elements/layout_blocks/line_layout.dart';
 import 'package:beam_reader/engine/elements/layout_blocks/multi_column_page.dart';
 import 'package:beam_reader/engine/elements/layout_blocks/paragraph_block.dart';
 import 'package:beam_reader/engine/elements/layout_blocks/text_inline_element.dart';
+import 'package:beam_reader/engine/elements/layout_blocks/line_break_inline_element.dart';
 import 'package:injectable/injectable.dart';
 
 import 'elements/data_blocks/inline_text.dart';
@@ -155,6 +156,10 @@ class AdvancedLayoutEngine{
     applyIndentIfNeeded();
 
     for(final elem in splitted) {
+      if (elem is LineBreakInlineElement) {
+        commitLine();
+        continue;
+      }
       double availableWidth = effectiveWidth - currentX;
       elem.performLayout(availableWidth);
 
@@ -229,17 +234,35 @@ class AdvancedLayoutEngine{
 
   List<InlineElement> _splitTokens(List<InlineElement> elements) {
     final result = <InlineElement>[];
-    for (final e in elements){
-      if(e is TextInlineElement){
-        final tokens = e.text.split(RegExp(r'(\s+)'));
-        for (final token in tokens){
-          final isSpace = token.trim().isEmpty;
-          if(isSpace){
+    final regex = RegExp(r'(\n|\s+)');
+    for (final e in elements) {
+      if (e is TextInlineElement) {
+        final text = e.text;
+        final matches = regex.allMatches(text);
+        int lastIndex = 0;
+        for (final match in matches) {
+          if (match.start > lastIndex) {
+            final segment = text.substring(lastIndex, match.start);
+            if (segment.isNotEmpty) {
+              result.add(TextInlineElement(text: segment, style: e.style));
+            }
+          }
+          final token = match.group(0)!;
+          if (token == '\n') {
+            result.add(LineBreakInlineElement());
+          } else {
             result.add(TextInlineElement(text: token, style: e.style));
-          }else{
-            result.add(TextInlineElement(text: "$token ", style: e.style));
+          }
+          lastIndex = match.end;
+        }
+        if (lastIndex < text.length) {
+          final tail = text.substring(lastIndex);
+          if (tail.isNotEmpty) {
+            result.add(TextInlineElement(text: tail, style: e.style));
           }
         }
+      } else {
+        result.add(e);
       }
     }
     return result;
