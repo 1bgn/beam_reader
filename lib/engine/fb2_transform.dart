@@ -1,18 +1,20 @@
-import 'dart:convert';
+// lib/engine/fb2_transform.dart
+
+import 'dart:convert' show base64;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
-import 'package:beam_reader/engine/hyphenator.dart';
 import 'package:xml/xml.dart';
 
-import 'elements/data_blocks/block_text.dart';
-import 'elements/data_blocks/inline_text.dart';
-import 'elements/data_blocks/text_run.dart';
+import 'package:beam_reader/engine/elements/data_blocks/block_text.dart';
+import 'package:beam_reader/engine/elements/data_blocks/inline_text.dart';
+import 'package:beam_reader/engine/elements/data_blocks/text_run.dart';
 
+/// =======================
+///  Бинарники изображений
+/// =======================
 
-// Блочные элементы: p, v, title, subtitle, text-author, etc.
-
-
+/// Собираем карту id -> bytes из <binary id="...">...</binary>
 Map<String, Uint8List> extractBinaryMap(XmlDocument doc) {
   final map = <String, Uint8List>{};
   for (final bin in doc.findAllElements('binary')) {
@@ -35,7 +37,11 @@ Future<ui.Image> decodeUiImage(Uint8List bytes) async {
   final frame = await codec.getNextFrame();
   return frame.image;
 }
-/// Типизация известных блочных тегов (не обязательно — можно хранить как String)
+
+/// =======================
+///     Типы блоков FB2
+/// =======================
+
 enum Fb2BlockTag {
   body,
   section,
@@ -56,12 +62,7 @@ enum Fb2BlockTag {
   td,
   unknown,
 }
-bool _isStyleContainer(String name) =>
-    name == 'title' ||
-        name == 'subtitle' ||
-        name == 'text-author' ||
-        name == 'epigraph' ||
-        name == 'cite';
+
 Fb2BlockTag fb2BlockTagFromName(String name) {
   switch (name) {
     case 'body': return Fb2BlockTag.body;
@@ -85,11 +86,20 @@ Fb2BlockTag fb2BlockTagFromName(String name) {
   }
 }
 
+bool _isStyleContainer(String name) =>
+    name == 'title' ||
+        name == 'subtitle' ||
+        name == 'text-author' ||
+        name == 'epigraph' ||
+        name == 'cite';
+
+/// =======================
+///     Трансформер FB2
+/// =======================
 
 class Fb2Transformer {
   Fb2Transformer();
-
-
+  int _sectionCounter = 0;
   static const Set<String> _blockTags = {
     'body','section','title','subtitle','p','empty-line','poem','stanza','v',
     'epigraph','annotation','cite','text-author','image','table','tr','td','th',
@@ -121,7 +131,7 @@ class Fb2Transformer {
   // ---------- Публичные ----------
   List<BlockText> parseToBlocks(XmlNode root) {
     final out = <BlockText>[];
-    _walk(root, out, path: const [], depth: 0, styleScope: null);
+    _walk(root, out, path: const [], depth: 0, styleScope: null, currentSection: 0); // NEW
     return out;
   }
   List<List<InlineText>> groupIntoLines(List<BlockText> blocks) =>
@@ -133,20 +143,19 @@ class Fb2Transformer {
       List<BlockText> sink, {
         required List<String> path,
         required int depth,
-        String? styleScope,        // ← добавили
+        String? styleScope,
+        required int currentSection, // NEW
       }) {
     if (node is XmlElement) {
       final tag = node.name.local;
-
       if (_skipEntirely.contains(tag)) return;
 
-      // определяем "стилистический контекст" для детей
       final nextStyleScope = _isStyleContainer(tag) ? tag : styleScope;
 
-      // листовой блок? (p, v, subtitle, text-author, empty-line, image, td, th)
-      final isLeafBlock = _leafBlocks.contains(tag);
+      // если вошли в новую <section> — присваиваем уникальный id
+      final nextSection = (tag == 'section') ? (++_sectionCounter) : currentSection; // NEW
 
-      // отдельно: <title> без <p> тоже считаем листом (редко, но бывает)
+      final isLeafBlock = _leafBlocks.contains(tag);
       final isTitleLeaf = tag == 'title' && !_hasChildTag(node, 'p');
 
       if (isLeafBlock || isTitleLeaf) {
@@ -154,32 +163,36 @@ class Fb2Transformer {
           node,
           path: [...path, tag],
           depth: depth,
-          overrideTag: styleScope,     // ← КЛЮЧ: подменяем на стиль родителя, если есть
+          overrideTag: styleScope,
+          sectionId: nextSection, // NEW
         ));
         return;
       }
 
-      // увеличиваем глубину для этих структур (как у тебя было)
       final nextDepth = (tag == 'section' || tag == 'poem' || tag == 'stanza' || tag == 'epigraph' || tag == 'cite')
           ? depth + 1
           : depth;
 
       for (final child in node.children) {
-        _walk(child, sink, path: [...path, tag], depth: nextDepth, styleScope: nextStyleScope);
+        _walk(child, sink,
+          path: [...path, tag],
+          depth: nextDepth,
+          styleScope: nextStyleScope,
+          currentSection: nextSection, // NEW
+        );
       }
-      return;
     }
-    // … остальное без изменений
   }
 
   BlockText _buildLeafBlock(
       XmlElement el, {
         required List<String> path,
         required int depth,
-        String? overrideTag,              // ← добавили
+        String? overrideTag,
+        required int sectionId, // NEW
       }) {
     final rawTag = el.name.local;
-    final tag = overrideTag ?? rawTag; // ← если пришёл стиль родителя — используем его
+    final tag = overrideTag ?? rawTag;
 
     if (rawTag == 'empty-line') {
       return BlockText(
@@ -188,39 +201,38 @@ class Fb2Transformer {
         inlines: const [],
         path: path,
         depth: depth,
+        attrs: {'__section': '$sectionId'}, // NEW
       );
     }
     if (rawTag == 'image') {
+      final at = _attrsOf(el)..['__section'] = '$sectionId'; // NEW
       return BlockText(
         tag: 'image',
         id: _nextId('image', path),
         inlines: const [],
         path: path,
         depth: depth,
-        attrs: _attrsOf(el),
+        attrs: at,
       );
     }
 
     final inlines = _parseInlineChildren(el, path: path);
+    final at = _attrsOf(el)..['__section'] = '$sectionId'; // NEW
     return BlockText(
-      tag: tag,                        // ← теперь заголовочные p станут 'title' и т.п.
+      tag: tag,
       id: _nextId(tag, path),
       inlines: _coalesceTextRuns(inlines),
       path: path,
       depth: depth,
-      attrs: _attrsOf(el),
+      attrs: at,
     );
   }
-
-
-
 
   List<InlineText> _parseInlineChildren(XmlElement parent, {required List<String> path}) {
     final out = <InlineText>[];
     for (final child in parent.children) {
       if (child is XmlText) {
-        var t = _normalizeSpaces(child.text);
-
+        final t = _normalizeSpaces(child.text);
         if (t.isNotEmpty) {
           out.add(TextRun(text: t, path: [...path, '#text']));
         }
@@ -230,7 +242,12 @@ class Fb2Transformer {
         final tag = child.name.local;
         if (_isInlineTag(tag)) {
           final kids = _parseInlineChildren(child, path: [...path, tag]);
-          out.add(InlineSpan(tag: tag, children: _coalesceTextRuns(kids), path: [...path, tag], attrs: _attrsOf(child)));
+          out.add(InlineSpan(
+            tag: tag,
+            children: _coalesceTextRuns(kids),
+            path: [...path, tag],
+            attrs: _attrsOf(child),
+          ));
           continue;
         }
         if (_isBlockTag(tag)) {
@@ -301,7 +318,3 @@ class Fb2Transformer {
     return out;
   }
 }
-
-
-
-

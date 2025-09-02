@@ -23,8 +23,8 @@ extension GetItInjectableX on _i174.GetIt {
   }) {
     final gh = _i526.GetItHelper(this, environment, environmentFilter);
     gh.lazySingleton<_i575.XmlLoader>(() => _i575.XmlLoader());
-    gh.lazySingleton<_i917.ReaderScreenController>(
-      () => _i917.ReaderScreenController(gh<_i575.XmlLoader>()),
+    gh.lazySingleton<_i917.ReaderPagerController>(
+      () => _i917.ReaderPagerController(gh<_i575.XmlLoader>()),
     );
     return this;
   }

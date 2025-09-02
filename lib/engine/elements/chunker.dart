@@ -106,16 +106,55 @@ class _MeasuredBlock {
   final double spaceBefore;
   final double spaceAfter;
   final double height;
-
+  final bool hardBreakBefore;
   _MeasuredBlock({
     required this.block,
     required this.span,
     required this.align,
+     this.hardBreakBefore=false,
     required this.indentLeft,
     required this.spaceBefore,
     required this.spaceAfter,
     required this.height,
   });
+}
+
+String? _sectionKeyOf(BlockText b) {
+  // ключ секции = путь до последнего 'section' в иерархии
+  final idx = b.path.lastIndexOf('section');
+  if (idx < 0) return null;
+  return b.path.take(idx + 1).join('/');
+}
+// lib/engine/elements/chunker.dart
+// ... твои импорты и существующие классы PageSlice, PageChunk, _MeasuredBlock и т. д.
+
+// Публичная функция: посчитать страницы для всей книги.
+List<PageSlice> paginateBlocksToPages({
+  required BuildContext context,
+  required List<BlockText> blocks,
+  required double viewportWidth,
+  required double viewportHeight,
+  EdgeInsets pagePadding = const EdgeInsets.symmetric(horizontal: 20, vertical: 28),
+  double baseFontSize = 18,
+  double lineHeight = 1.6,
+  double paragraphSpacing = 10,
+  Color? linkColor,
+}) {
+  final usableWidth  = viewportWidth  - pagePadding.horizontal;
+  final usableHeight = viewportHeight - pagePadding.vertical;
+  if (usableWidth <= 0 || usableHeight <= 0 || blocks.isEmpty) return const [];
+
+  final measured = _measureBlocks(
+    context: context,
+    blocks: blocks,
+    maxWidth: usableWidth,
+    baseFontSize: baseFontSize,
+    lineHeight: lineHeight,
+    paraBaseSpacing: paragraphSpacing,
+    linkColor: linkColor ?? Theme.of(context).colorScheme.primary,
+  );
+
+  return _paginateMeasured(measured, usableHeight);
 }
 
 List<_MeasuredBlock> _measureBlocks({
@@ -130,6 +169,9 @@ List<_MeasuredBlock> _measureBlocks({
   final out = <_MeasuredBlock>[];
   final direction = Directionality.of(context);
 
+  String? prevSectionId;
+  String? prevSectionKey;
+
   for (final b in blocks) {
     final s = _styleForBlockTag(
       context: context,
@@ -140,6 +182,41 @@ List<_MeasuredBlock> _measureBlocks({
       sectionDepth: b.depth,
     );
 
+    // detect section boundary
+    final sectionId = b.attrs?['__section'];
+    final isNewSection = (prevSectionId != null && sectionId != null && sectionId != prevSectionId);
+    prevSectionId = sectionId ?? prevSectionId;
+
+    // --- IMAGE: измеряем по контейнерной ширине и аспекту ---
+    if (b.tag == 'image') {
+      final cf = s.containerWidthFactor ?? 1.0;
+      final w  = maxWidth * cf;
+
+      // если в attrs есть размеры, используем их; иначе дефолтный аспект
+      final aw = double.tryParse(b.attrs?['width']  ?? '');
+      final ah = double.tryParse(b.attrs?['height'] ?? '');
+
+      double h;
+      if (aw != null && ah != null && aw > 0 && ah > 0) {
+        h = w * (ah / aw);
+      } else {
+        h = w * 0.6; // разумная эвристика (16:9 ≈ 0.5625, можно поменять)
+      }
+
+      out.add(_MeasuredBlock(
+        block: b,
+        span: const TextSpan(text: ''), // не нужен для картинок
+        align: s.textAlign,
+        indentLeft: 0,
+        spaceBefore: s.spaceBefore,
+        spaceAfter: s.spaceAfter,
+        height: h,
+        hardBreakBefore: isNewSection,
+      ));
+      continue; // важно: пропускаем TextPainter
+    }
+
+    // --- EMPTY-LINE как и было ---
     if (b.tag == 'empty-line') {
       final h = baseFontSize * lineHeight * 0.7;
       out.add(_MeasuredBlock(
@@ -150,21 +227,17 @@ List<_MeasuredBlock> _measureBlocks({
         spaceBefore: s.spaceBefore,
         spaceAfter: s.spaceAfter,
         height: h,
+        hardBreakBefore: isNewSection,
       ));
       continue;
     }
 
+    // --- обычный текст ---
     final textSpan = TextSpan(
       style: s.textStyle,
-      children: b.inlines
-          .map((node) => _inlineToTextSpan(
-        node,
-        s.textStyle,
-        linkColor,
-        baseFontSize,
-        lineHeight,
-      ))
-          .toList(),
+      children: b.inlines.map((node) =>
+          _inlineToTextSpan(node, s.textStyle, linkColor, baseFontSize, lineHeight)
+      ).toList(),
     );
 
     final painter = TextPainter(
@@ -172,7 +245,11 @@ List<_MeasuredBlock> _measureBlocks({
       textDirection: direction,
       textAlign: s.textAlign,
       maxLines: null,
-    )..layout(maxWidth: maxWidth - s.indentLeft);
+    );
+
+    final cf = s.containerWidthFactor ?? 1.0;
+    final measureWidth = maxWidth * cf;
+    painter.layout(maxWidth: measureWidth);
 
     out.add(_MeasuredBlock(
       block: b,
@@ -182,9 +259,10 @@ List<_MeasuredBlock> _measureBlocks({
       spaceBefore: s.spaceBefore,
       spaceAfter: s.spaceAfter,
       height: painter.height,
+      hardBreakBefore: isNewSection,
     ));
-  }
 
+  }
   return out;
 }
 
@@ -195,25 +273,33 @@ List<PageSlice> _paginateMeasured(List<_MeasuredBlock> items, double maxHeight) 
 
   for (int i = 0; i < items.length; i++) {
     final it = items[i];
-    final blockTotal =
-        (pages.isEmpty && i == 0 ? 0 : it.spaceBefore) + it.height + it.spaceAfter;
 
-    if (cursor + blockTotal > maxHeight && i > pageStartBlock) {
-      // закрываем страницу до предыдущего блока
+    // Жёсткий разрыв перед блоком (если страница уже не пустая)
+    if (it.hardBreakBefore && i > pageStartBlock) {
       pages.add(PageSlice(pageStartBlock, i));
       pageStartBlock = i;
       cursor = 0;
     }
 
-    cursor += blockTotal;
+    final spaceBefore = (cursor == 0) ? 0 : it.spaceBefore;
+    final blockTotal  = spaceBefore + it.height + it.spaceAfter;
+
+    // Обычное переполнение — переносим на новую страницу
+    if (cursor + blockTotal > maxHeight && i > pageStartBlock) {
+      pages.add(PageSlice(pageStartBlock, i));
+      pageStartBlock = i;
+      cursor = 0;
+    }
+
+    cursor += (cursor == 0) ? (it.height + it.spaceAfter) : blockTotal;
   }
 
   if (pageStartBlock < items.length) {
     pages.add(PageSlice(pageStartBlock, items.length));
   }
-
   return pages;
 }
+
 
 /* ============================ стили и инлайны ============================ */
 
@@ -224,15 +310,18 @@ class _BlockStyle {
   final double spaceBefore;
   final double spaceAfter;
 
+  // NEW: ширина контейнера как доля от колонки (как в движке)
+  final double? containerWidthFactor;
+
   _BlockStyle({
     required this.textStyle,
     required this.textAlign,
     required this.indentLeft,
     required this.spaceBefore,
     required this.spaceAfter,
+    this.containerWidthFactor, // NEW
   });
 }
-
 _BlockStyle _styleForBlockTag({
   required BuildContext context,
   required String tag,

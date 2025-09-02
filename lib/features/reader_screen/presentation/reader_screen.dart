@@ -1,58 +1,93 @@
-// lib/features/reader_screen/presentation/reader_screen.dart
+// lib/features/reader_screen/presentation/paged_reader_screen.dart
 import 'package:beam_reader/di/injectable.dart';
-import 'package:beam_reader/engine/elements/layout_blocks/custom_text_layout.dart';
 import 'package:beam_reader/engine/elements/layout_blocks/multi_column_page.dart';
-import 'package:beam_reader/features/reader_screen/appication/reader_screen_controller.dart';
-
-import 'package:beam_reader/features/reader_screen/presentation/widgets/paged_view_reader.dart';
+import 'package:beam_reader/engine/elements/layout_blocks/custom_text_layout.dart';
+import 'package:beam_reader/features/reader_screen/presentation/widgets/single_page_view.dart';
 import 'package:flutter/material.dart';
 import 'package:signals_flutter/signals_flutter.dart';
 
-class ReaderScreen extends StatefulWidget {
-  const ReaderScreen({super.key});
+import '../appication/reader_screen_controller.dart';
+
+class PagedReaderScreen extends StatefulWidget {
+  const PagedReaderScreen({super.key});
 
   @override
-  State<ReaderScreen> createState() => _ReaderScreenState();
+  State<PagedReaderScreen> createState() => _PagedReaderScreenState();
 }
 
-class _ReaderScreenState extends State<ReaderScreen> {
-  final ReaderScreenController controller = getIt();
+class _PagedReaderScreenState extends State<PagedReaderScreen> {
+  final ReaderPagerController controller = getIt();
+  final _pageCtrl = PageController();
 
   @override
   void initState() {
     super.initState();
-    controller.buildBook(context);
+    controller.init(context);
+  }
+
+  @override
+  void dispose() {
+    _pageCtrl.dispose();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    final size = MediaQuery.of(context).size;
+    const pagePadding = EdgeInsets.symmetric(horizontal: 20, vertical: 28);
+    final usableWidth  = size.width  - pagePadding.horizontal;
+    final usableHeight = size.height - pagePadding.vertical;
+
     return Scaffold(
-      body: Watch((context) {
-        final layout = controller.textLayout.value;
-        if (layout == null) {
+      backgroundColor: Colors.white,
+      body: Watch((ctx) {
+        final total = controller.totalPages.value;
+        if (total == 0) {
           return const Center(child: CircularProgressIndicator());
         }
-        return SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.symmetric(vertical: 12),
-            child: PagedReaderView(
-              layout: layout,
-              columnsPerPage: 1,      // сделай 2/3 — будет много колонок на странице
-              columnSpacing: 24,
-              lineSpacing: 0,
-              allowSoftHyphens: true,
-              enableSelection: true,
-              doubleTapSelectsWord: true,
-              tripleTapSelectsLine: true,
-              holdToSelect: true,
-              clearSelectionOnSingleTap: true,
-              onSelectionChanged: (s, e) {
-                // например, показывать тулбар/копирование
-              },
-            ),
-          ),
+
+        return PageView.builder(
+          controller: _pageCtrl,
+          onPageChanged: (i) => controller.prefetchAround(context, i),
+          itemCount: total,
+          itemBuilder: (ctx, index) {
+            final layout = controller.getPage(index);
+            if (layout == null) {
+              controller.ensurePage(context, index);
+              return const Center(child: CircularProgressIndicator());
+            }
+
+            final page = _buildPageFromLayout(
+              Size(usableWidth, usableHeight),  // ← пробрасываем usable размер
+              layout,
+            );
+
+            return Padding(
+              padding: pagePadding,             // ← рисуем в том же окне, что и при измерении
+              child: SizedBox(
+                width: usableWidth,
+                height: usableHeight,
+                child: SinglePageView(
+                  page: page,
+                  lineSpacing: 0,
+                  allowSoftHyphens: true,
+                ),
+              ),
+            );
+          },
         );
       }),
+    );
+  }
+
+
+  MultiColumnPage _buildPageFromLayout(Size usable, CustomTextLayout layout) {
+    return MultiColumnPage(
+      columns: [layout.lines],
+      pageWidth: usable.width,
+      pageHeight: usable.height, // не критично, но консистентно
+      columnWidth: usable.width, // ← ключевое: колонка = usableWidth
+      columnSpacing: 0,
     );
   }
 }
