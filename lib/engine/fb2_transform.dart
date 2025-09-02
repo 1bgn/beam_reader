@@ -1,3 +1,4 @@
+import 'package:beam_reader/engine/hyphenator.dart';
 import 'package:xml/xml.dart';
 
 import 'elements/data_blocks/block_text.dart';
@@ -57,7 +58,6 @@ Fb2BlockTag fb2BlockTagFromName(String name) {
 
 class Fb2Transformer {
   Fb2Transformer();
-
   static const Set<String> _blockTags = {
     'body','section','title','subtitle','p','empty-line','poem','stanza','v',
     'epigraph','annotation','cite','text-author','image','table','tr','td','th',
@@ -170,7 +170,8 @@ class Fb2Transformer {
     final out = <InlineText>[];
     for (final child in parent.children) {
       if (child is XmlText) {
-        final t = _normalizeSpaces(child.text);
+        var t = _normalizeSpaces(child.text);
+
         if (t.isNotEmpty) {
           out.add(TextRun(text: t, path: [...path, '#text']));
         }

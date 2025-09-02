@@ -4,11 +4,11 @@ import 'package:flutter/material.dart';
 
 import 'package:beam_reader/engine/elements/layout_blocks/inline_element.dart';
 
-class TextInlineParagraph extends InlineElement{
+class TextInlineElement extends InlineElement{
   final String text;
   final TextStyle style;
 
-  TextInlineParagraph({required this.text, required this.style});
+  TextInlineElement({required this.text, required this.style});
 
   ui.Paragraph? _paragraphCache;
 
