@@ -58,4 +58,31 @@ class TextInlineElement extends InlineElement{
     }
 
   }
+  int countSpacesInRange(int start, int end) {
+    final s = start.clamp(0, text.length);
+    final e = end.clamp(0, text.length);
+    var k = 0;
+    for (var i = s; i < e; i++) {
+      if (text.codeUnitAt(i) == 0x20) k++;
+    }
+    return k;
+  }
+  List<ui.TextBox> selectionBoxes(int start, int end) {
+    final p = _paragraphCache;
+    if (p == null) return const [];
+    final s = start.clamp(0, text.length);
+    final e = end.clamp(0, text.length);
+    if (e <= s) return const [];
+    return p.getBoxesForRange(s, e);
+  }
+  int caretOffsetForX(double localX) {
+    final p = _paragraphCache;
+    if (p == null) return 0;
+    // Для однострочного параграфа достаточно любой Y внутри строки (0 тоже ок).
+    final pos = p.getPositionForOffset(Offset(localX, 0));
+    var off = pos.offset;
+    if (off < 0) off = 0;
+    if (off > text.length) off = text.length;
+    return off;
+  }
 }

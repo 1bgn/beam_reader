@@ -11,13 +11,16 @@ import 'package:injectable/injectable.dart';
 import 'package:xml/xml.dart';
 import 'package:signals_flutter/signals_flutter.dart';
 import '../../../engine/elements/chunker.dart';
+import '../../../engine/elements/fb2_style_map.dart';
 import '../../../engine/fb2_transform.dart';
+
+
+
 
 @LazySingleton()
 class ReaderScreenController {
   final XmlLoader xmlLoader;
   final Signal<CustomTextLayout?> textLayout = signal(null);
-  // final Fb2Parser fb2parser;
 
   ReaderScreenController(this.xmlLoader);
 
@@ -26,72 +29,84 @@ class ReaderScreenController {
 
     final bookStringXml = await loadBook();
     final bookXml = XmlDocument.parse(bookStringXml);
-    final bodyXml = bookXml.findAllElements("body");
-    final sections = bodyXml?.first.findElements("section");
     final transformer = Fb2Transformer();
-
     final blocks = transformer.parseToBlocks(bookXml.rootElement);
 
-    // final lines = transformer.groupIntoLines(blocks);
+    // параметры типографики (должны совпадать с движком/рендером)
+    const baseFontSize   = 16.0;
+    const lineHeight     = 1.6;
+    const paragraphSpace = 10.0;
+
     final chunks = chunkBlocksByPages(
       context: context,
       blocks: blocks,
       viewportWidth: MediaQuery.of(context).size.width,
       viewportHeight: MediaQuery.of(context).size.height,
-      targetPagesPerChunk: 25, // ≈ по 25 страниц
-      // настройки должны совпадать с вашим рендером:
-      baseFontSize: 14,
-      lineHeight: 1.6,
-      paragraphSpacing: 10,
+      targetPagesPerChunk: 25,
+      baseFontSize: baseFontSize,
+      lineHeight: lineHeight,
+      paragraphSpacing: paragraphSpace,
       pagePadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 28),
     );
-    final AdvancedLayoutEngine advancedLayoutEngine = AdvancedLayoutEngine(
+
+    // возьмём первый чанк (дальше можно подключить постраничную навигацию)
+    final slice = blocks.sublist(chunks.first.blockStart, chunks.first.blockEnd);
+
+    final pageWidth = MediaQuery.of(context).size.width;
+
+    // строим ParagraphBlock'и с учётом стилей по тегам
+    final paragraphs = <ParagraphBlock>[];
+    for (final b in slice) {
+      final s = fb2BlockRenderStyle(
+        tag: b.tag,
+        depth: b.depth,
+        baseFontSize: baseFontSize,
+        lineHeight: lineHeight,
+        color: Colors.black,
+      );
+
+      if (b.tag == 'empty-line') {
+        paragraphs.add(
+          ParagraphBlock(
+            inlineElements: const [],
+            textAlign: TextAlign.start,
+            paragraphSpacing: s.paragraphSpacing,
+            enableRedLine: false,
+            firstLineIndent: 0,
+          ),
+        );
+        continue;
+      }
+
+      final inlines = buildInlineElements(b.inlines, s.textStyle);
+
+      paragraphs.add(
+        ParagraphBlock(
+          inlineElements: inlines,
+          textAlign: s.textAlign,
+          paragraphSpacing: s.paragraphSpacing,
+          enableRedLine: s.enableRedLine,
+          firstLineIndent: s.firstLineIndent,          // может быть отрицательным (epigraph)
+          maxWidth: s.containerWidthFactor,            // сужаем контейнер для epigraph/cite
+          containerAlignment: s.containerAlign,        // выравнивание контейнера
+          // при необходимости: minimumLines, textDirection и т.п.
+        ),
+      );
+    }
+
+    final engine = AdvancedLayoutEngine(
       allowSoftHyphens: true,
-      paragraphs: blocks.sublist(chunks.first.blockStart, chunks.first.blockEnd).map((e)=>e.inlines)
-          .map(
-            (e) => ParagraphBlock(
-              textAlign: TextAlign.justify,
-              inlineElements: e
-                  .map(
-                    (e) => TextInlineElement(
-
-                      text: (e is TextRun) ? e.text : "",
-
-                      style: TextStyle(color: Colors.black),
-                    ),
-                  )
-                  .toList(),
-            ),
-          )
-          .toList(),
-      globalMaxWidth: MediaQuery.of(context).size.width,
-      globalTextAlign: TextAlign.justify,
+      paragraphs: paragraphs,
+      globalMaxWidth: pageWidth,
+      globalTextAlign: TextAlign.justify, // дефолт для тех абзацев, где не задан
     );
-    print("lines ${advancedLayoutEngine.paragraphs}");
-   CustomTextLayout customTextLayout =  advancedLayoutEngine.layoutAllParagraphs();
-   textLayout.value = customTextLayout;
-    final end = DateTime.now();
-    final diff = end.difference(start);
 
-    print('Время выполнения: ${diff.inMilliseconds} мс');
-    // for (final line in lines) {
-    //   final buf = StringBuffer();
-    //   for (final inline in line) {
-    //     if (inline is TextRun) {
-    //       buf.write(inline.text);
-    //     } else if (inline is InlineSpan) {
-    //
-    //       buf.write(inline.toString());
-    //     }
-    //   }
-    //   print(buf.toString());
-    // }
-    //
-    // print("GOTOVO");
+    final customTextLayout = engine.layoutAllParagraphs();
+    textLayout.value = customTextLayout;
+
+    debugPrint('layout: ${DateTime.now().difference(start).inMilliseconds} ms');
     return blocks;
   }
 
-  Future<String> loadBook() {
-    return xmlLoader.loadBook();
-  }
+  Future<String> loadBook() => xmlLoader.loadBook();
 }
