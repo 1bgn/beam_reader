@@ -30,35 +30,23 @@ class ReaderPagerController {
   final XmlLoader xmlLoader;
   ReaderPagerController(this.xmlLoader);
 
-  /// Сколько страниц уже посчитано (якорей известно)
   final totalPages = signal<int>(0);
 
-  // Книга (сырые блоки)
   late List<BlockText> _blocks;
-
-  // Бинарники и кэш ui.Image
   late Map<String, Uint8List> _binaries;
   final Map<String, ui.Image> _imgCache = {};
 
-  // Кэш собранных страниц
   final Map<int, CustomTextLayout> _pageCache = {};
-
-  // Якоря начала страниц
   final List<_PageAnchor> _anchors = [];
-
-  // Против гонок
   final Map<int, Future<void>> _inflight = {};
 
   bool _inited = false;
 
-  // Типографика (синхронизируй с рендером)
   static const _baseFontSize = 16.0;
   static const _lineHeight   = 1.6;
+  static const _pagePadding  = EdgeInsets.symmetric(horizontal: 20, vertical: 28);
 
-  // Должно совпадать с паддингом страницы в UI
-  static const _pagePadding = EdgeInsets.symmetric(horizontal: 20, vertical: 28);
-
-  /* ============================ API ============================ */
+  /* API */
 
   ReaderAnchor anchorForPage(int index) {
     if (_anchors.isEmpty) return const ReaderAnchor(0, 0);
@@ -67,7 +55,6 @@ class ReaderPagerController {
     return ReaderAnchor(a.blockIndex, a.charOffset);
   }
 
-  /// Полный пересчёт под новый вьюпорт, сохраняя позицию.
   Future<void> reflow(BuildContext context, {ReaderAnchor? preserve}) async {
     final keep = preserve ?? anchorForPage(0);
     _pageCache.clear();
@@ -75,7 +62,6 @@ class ReaderPagerController {
     _anchors
       ..clear()
       ..add(_PageAnchor(blockIndex: keep.blockIndex, charOffset: keep.charOffset));
-
     totalPages.value = 1;
     await Future.wait([ensurePage(context, 0), ensurePage(context, 1)]);
   }
@@ -100,20 +86,16 @@ class ReaderPagerController {
   Future<void> ensurePage(BuildContext context, int pageIndex) async {
     if (pageIndex < 0) return;
 
-    // уже строим — дождаться
     final infl = _inflight[pageIndex];
     if (infl != null) { await infl; return; }
 
-    // гарантируем якоря до нужного индекса
     while (pageIndex >= _anchors.length) {
       final lastIdx = _anchors.length - 1;
       final before  = _anchors.length;
-
       final fut = _buildAndCachePage(context, lastIdx, computeNextAnchorOnly: true);
       _inflight[lastIdx] = fut;
       await fut.whenComplete(() => _inflight.remove(lastIdx));
-
-      if (_anchors.length == before) break; // дальше нечего листать
+      if (_anchors.length == before) break;
     }
 
     if (_pageCache.containsKey(pageIndex)) return;
@@ -129,7 +111,7 @@ class ReaderPagerController {
     }
   }
 
-  /* ============================ Низкий уровень ============================ */
+  /* Low level */
 
   Future<ui.Image?> _resolveImageForAttrs(Map<String, String>? attrs) async {
     if (attrs == null) return null;
@@ -178,9 +160,9 @@ class ReaderPagerController {
       final img = await _resolveImageForAttrs(block.attrs);
       if (img != null) {
         final mq = MediaQuery.of(context);
-        final safeH = mq.size.height - mq.padding.top - mq.padding.bottom;
+        final safeH   = mq.size.height - mq.padding.top - mq.padding.bottom;
         final usableH = safeH - _pagePadding.vertical;
-        final maxH = usableH * 0.9;
+        final maxH    = (usableH * 0.9).clamp(1.0, double.infinity);
 
         paragraphs.add(ParagraphBlock(
           inlineElements: [
@@ -237,20 +219,21 @@ class ReaderPagerController {
     required int startLine,
     required int endLineInclusive,
   }) {
+    if (lines.isEmpty) return 0;
+    final s = startLine.clamp(0, lines.length - 1);
+    final e = endLineInclusive.clamp(s, lines.length - 1);
+
     int total = 0;
-    for (int li = startLine; li <= endLineInclusive; li++) {
+    for (int li = s; li <= e; li++) {
       if (pidx[li] != paraIndex) continue;
 
       int lineChars = 0;
       for (final el in lines[li].elements) {
         if (el is TextInlineElement) {
-          lineChars += el.text.replaceAll('\u00AD', '').length; // убираем soft hyphen
+          lineChars += el.text.replaceAll('\u00AD', '').length;
         }
       }
-
-      if (_lineEndsWithDrawnHyphen(lines[li]) && lineChars > 0) {
-        lineChars -= 1; // рисованный дефис не «оригинальный»
-      }
+      if (_lineEndsWithDrawnHyphen(lines[li]) && lineChars > 0) lineChars -= 1;
       if (lineChars > 0) total += lineChars;
     }
     return total;
@@ -261,19 +244,18 @@ class ReaderPagerController {
         (a.blockIndex == b.blockIndex && a.charOffset > b.charOffset);
   }
 
-  _PageAnchor? _forceAdvanceAfter(_PageAnchor candidate, _PageAnchor current) {
+  _PageAnchor? _forceAdvanceAfter(_PageAnchor? candidate, _PageAnchor current) {
+    if (candidate == null) return null;
     if (_isAfter(candidate, current)) return candidate;
 
-    // сдвинем хотя бы на символ вперёд в текущем блоке, если можем
     final blLen = inlineTextTotalLength(_blocks[current.blockIndex].inlines);
     if (current.charOffset < blLen) {
       return _PageAnchor(blockIndex: current.blockIndex, charOffset: current.charOffset + 1);
     }
-    // иначе — следующий блок, если есть
     if (current.blockIndex + 1 < _blocks.length) {
       return _PageAnchor(blockIndex: current.blockIndex + 1, charOffset: 0);
     }
-    return null; // дальше нечего листать
+    return null;
   }
 
   Future<void> _buildAndCachePage(
@@ -283,7 +265,6 @@ class ReaderPagerController {
       }) async {
     if (pageIndex < 0 || pageIndex >= _anchors.length) return;
 
-    // Габариты с учётом SafeArea и внутренних отступов
     final mq = MediaQuery.of(context);
     final safeWidth  = mq.size.width  - mq.padding.left - mq.padding.right;
     final safeHeight = mq.size.height - mq.padding.top  - mq.padding.bottom;
@@ -291,10 +272,8 @@ class ReaderPagerController {
     final usableWidth  = safeWidth  - _pagePadding.horizontal;
     final usableHeight = safeHeight - _pagePadding.vertical;
 
-    // стартовый якорь
     final start = _anchors[pageIndex];
 
-    // собираем параграфы постепенно, пока страница не заполнится
     final paragraphs = <ParagraphBlock>[];
     final metas      = <_ParaMeta>[];
 
@@ -304,7 +283,10 @@ class ReaderPagerController {
     CustomTextLayout? layout;
     List<LineLayout>  visibleLines = [];
     double usedHeight = 0;
-    int prevVisibleCount = 0;
+
+    int prevVisibleCount = -1;       // ← контроль прогресса
+    int stagnantIters    = 0;        // ← защита от зависаний
+    const int kMaxStagnantIters = 2; // допустим 2 итерации без роста
 
     while (bi < _blocks.length) {
       await _pushBlockSliceAsParagraphWithMeta(
@@ -326,7 +308,6 @@ class ReaderPagerController {
       );
       layout = engine.layoutAllParagraphs();
 
-      // сколько строк помещается по высоте страницы
       visibleLines = [];
       usedHeight   = 0;
       for (final line in layout.lines) {
@@ -336,19 +317,26 @@ class ReaderPagerController {
         usedHeight += h;
       }
 
-      if (visibleLines.length == prevVisibleCount) break; // страховка
-      prevVisibleCount = visibleLines.length;
+      // — Стоп-кран зависаний —
+      if (visibleLines.length == prevVisibleCount) {
+        stagnantIters++;
+        if (stagnantIters >= kMaxStagnantIters) {
+          break; // выходим из набора, иначе можем крутиться бесконечно
+        }
+      } else {
+        stagnantIters = 0;
+        prevVisibleCount = visibleLines.length;
+      }
 
       if (usedHeight >= usableHeight || bi >= _blocks.length) break;
     }
 
     if (layout == null) return;
 
-    // считаем якорь следующей страницы
+    // --- следующий якорь ---
     _PageAnchor? nextAnchor;
 
     if (visibleLines.isEmpty) {
-      // очень большой элемент — начинаем со следующего блока
       final lastBlock = metas.isNotEmpty ? metas.last.blockIndex : start.blockIndex;
       final nb = lastBlock + 1;
       nextAnchor = (nb < _blocks.length) ? _PageAnchor(blockIndex: nb, charOffset: 0) : null;
@@ -357,7 +345,6 @@ class ReaderPagerController {
       final lastVisibleLineIndex = visibleLines.length - 1;
       final lastParaIndex        = pidx[lastVisibleLineIndex];
 
-      // статистика строк по параграфам
       final totalLinesPerPara = <int,int>{};
       for (final idx in pidx) {
         totalLinesPerPara[idx] = (totalLinesPerPara[idx] ?? 0) + 1;
@@ -372,8 +359,17 @@ class ReaderPagerController {
       final visibleInLast = visibleLinesPerPara[lastParaIndex] ?? 0;
       final bool hasInvisibleParas = lastParaIndex < (paragraphs.length - 1);
 
-      if (visibleInLast < totalInLast) {
-        // разрез внутри последнего параграфа
+      final bool lastParaIsImage = paragraphs[lastParaIndex]
+          .inlineElements
+          .any((e) => e is ImageInlineElement);
+
+      if (lastParaIsImage) {
+        final meta = metas[lastParaIndex];
+        final nb = meta.blockIndex + 1;
+        nextAnchor = (nb < _blocks.length)
+            ? _PageAnchor(blockIndex: nb, charOffset: 0)
+            : null;
+      } else if (visibleInLast < totalInLast) {
         int charsInLastParaVisible = _countParaCharsInLinesRange(
           lines: visibleLines,
           pidx: pidx,
@@ -387,7 +383,6 @@ class ReaderPagerController {
           charsInLastParaVisible -= 1;
         }
 
-        // если разрыв внутри слова — переносим последнюю строку целиком
         final paraText = _concatParagraphText(paragraphs[lastParaIndex]);
         bool breaksInsideWord = false;
         if (charsInLastParaVisible > 0 && charsInLastParaVisible < paraText.length) {
@@ -404,14 +399,12 @@ class ReaderPagerController {
             startLine: 0,
             endLineInclusive: lastVisibleLineIndex - 1,
           );
-
           final meta = metas[lastParaIndex];
           nextAnchor = _PageAnchor(
             blockIndex: meta.blockIndex,
             charOffset: meta.startOffsetInBlock + charsBeforeLastLine,
           );
 
-          // подрезаем текущую страницу, чтобы не дублировать строку
           usedHeight -= visibleLines[lastVisibleLineIndex].height;
           visibleLines = visibleLines.sublist(0, lastVisibleLineIndex);
         } else {
@@ -422,14 +415,12 @@ class ReaderPagerController {
           );
         }
       } else if (hasInvisibleParas) {
-        // следующий абзац вообще не поместился — с него и начнём
         final nextParaMeta = metas[lastParaIndex + 1];
         nextAnchor = _PageAnchor(
           blockIndex: nextParaMeta.blockIndex,
           charOffset: nextParaMeta.startOffsetInBlock,
         );
       } else {
-        // абзац целиком помещён — следующий блок
         final meta = metas[lastParaIndex];
         final nextBlock = meta.blockIndex + 1;
         nextAnchor = (nextBlock < _blocks.length)
@@ -438,30 +429,35 @@ class ReaderPagerController {
       }
     }
 
-    // Строгое продвижение якоря вперёд (убирает дубли страниц)
-    if (nextAnchor != null) {
-      nextAnchor = _forceAdvanceAfter(nextAnchor, start);
-    }
+    // строгое продвижение якоря (убирает дубли)
+    nextAnchor = _forceAdvanceAfter(nextAnchor, start);
 
-    // Если это был «прогон на якорь» — только добавим его
+    // computeNextAnchorOnly → только расширяем anchors, не кэшируем страницу
     if (computeNextAnchorOnly) {
       if (nextAnchor != null) {
-        _anchors.add(nextAnchor);
-        totalPages.value = _anchors.length;
+        final last = _anchors.last;
+        final toAdd = _forceAdvanceAfter(nextAnchor, last);
+        if (toAdd != null && _isAfter(toAdd, last)) {
+          _anchors.add(toAdd);
+          totalPages.value = _anchors.length;
+        }
       }
       return;
     }
 
-    // Не кэшируем пустые страницы (чтобы не было визуально пустых листов)
+    // пустые страницы не кэшируем
     if (visibleLines.isEmpty) {
       if (nextAnchor != null && _anchors.length == pageIndex + 1) {
-        _anchors.add(nextAnchor);
-        totalPages.value = _anchors.length;
+        final last = _anchors.last;
+        final toAdd = _forceAdvanceAfter(nextAnchor, last);
+        if (toAdd != null && _isAfter(toAdd, last)) {
+          _anchors.add(toAdd);
+          totalPages.value = _anchors.length;
+        }
       }
       return;
     }
 
-    // Кэш страницы (только видимые строки)
     final pageLayout = CustomTextLayout(
       lines: visibleLines,
       totalHeight: usedHeight,
@@ -470,12 +466,16 @@ class ReaderPagerController {
     _pageCache[pageIndex] = pageLayout;
 
     if (nextAnchor != null && _anchors.length == pageIndex + 1) {
-      _anchors.add(nextAnchor);
-      totalPages.value = _anchors.length;
+      final last = _anchors.last;
+      final toAdd = _forceAdvanceAfter(nextAnchor, last);
+      if (toAdd != null && _isAfter(toAdd, last)) {
+        _anchors.add(toAdd);
+        totalPages.value = _anchors.length;
+      }
     }
   }
 
-  /* ============================ Вспомогалки текста ============================ */
+  /* helpers */
 
   final RegExp _wordCharRe = RegExp(r'[A-Za-zА-Яа-яЁё0-9]');
   bool _isWordCU(int cu) => _wordCharRe.hasMatch(String.fromCharCode(cu));
@@ -488,8 +488,6 @@ class ReaderPagerController {
     return sb.toString();
   }
 }
-
-/* ============================ Модели-метаданные ============================ */
 
 class _ParaMeta {
   final int blockIndex;

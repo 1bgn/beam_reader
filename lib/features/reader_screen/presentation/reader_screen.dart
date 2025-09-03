@@ -17,12 +17,12 @@ class PagedReaderScreen extends StatefulWidget {
 
 class _PagedReaderScreenState extends State<PagedReaderScreen> {
   final ReaderPagerController controller = getIt();
-  final _pageCtrl = PageController();
+  final PageController _pageCtrl = PageController();
 
   int _currentIndex = 0;
   Orientation? _lastOrientation;
 
-  // симметричные поля: слева=20, справа=20, сверху/снизу=28
+  // симметричные поля
   static const EdgeInsets _contentPad =
   EdgeInsets.symmetric(horizontal: 20, vertical: 28);
 
@@ -30,6 +30,12 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
   void initState() {
     super.initState();
     controller.init(context);
+
+    // первичная подгрузка вокруг первой страницы — после первого кадра
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      controller.prefetchAround(context, _currentIndex);
+    });
   }
 
   @override
@@ -42,12 +48,12 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.white,
-      body: SafeArea( // не уходим под динамик/вырез
+      body: SafeArea(
         child: OrientationBuilder(
           builder: (ctx, orientation) {
+            // при повороте — сохраняем якорь и полностью пересчитываем
             if (_lastOrientation != orientation) {
               _lastOrientation = orientation;
-
               final anchor = controller.anchorForPage(_currentIndex);
               WidgetsBinding.instance.addPostFrameCallback((_) async {
                 await controller.reflow(context, preserve: anchor);
@@ -60,7 +66,6 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
 
             return LayoutBuilder(
               builder: (ctx, constraints) {
-                // размер уже с учётом SafeArea
                 final safeSize = constraints.biggest;
 
                 return Watch((ctx) {
@@ -71,17 +76,32 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
 
                   return PageView.builder(
                     controller: _pageCtrl,
-                    physics: const BouncingScrollPhysics(parent: PageScrollPhysics()),
+                    allowImplicitScrolling: true, // iOS lookahead для соседних
+                    physics: const PageScrollPhysics(),
+                    // ВАЖНО: подгружаем только когда страница уже в центре
                     onPageChanged: (i) {
                       _currentIndex = i;
-                      controller.prefetchAround(context, i);
+
+                      // даём этому кадру дорисоваться, затем считаем
+                      WidgetsBinding.instance.addPostFrameCallback((_) {
+                        if (!mounted) return;
+                        // подгружаем текущую (на случай плейсхолдера) и соседние
+                        controller.ensurePage(context, i);
+                        controller.prefetchAround(context, i, radius: 2);
+                      });
                     },
                     itemCount: total,
                     itemBuilder: (ctx, index) {
                       final layout = controller.getPage(index);
+
                       if (layout == null) {
-                        controller.ensurePage(context, index);
-                        return const Center(child: CircularProgressIndicator());
+                        // Плейсхолдер без тяжёлых расчётов — НИЧЕГО не считаем здесь
+                        return Padding(
+                          padding: _contentPad,
+                          child: const RepaintBoundary(
+                            child: ColoredBox(color: Colors.white),
+                          ),
+                        );
                       }
 
                       final page = _buildPageFromLayout(
@@ -90,14 +110,15 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
                         _contentPad,
                       );
 
-                      // важное: паддинг вокруг канвы, а внутрь передаём pageHeight без этих паддингов
                       return Padding(
                         padding: _contentPad,
-                        child: SizedBox.expand(
-                          child: SinglePageView(
-                            page: page,
-                            lineSpacing: 0,
-                            allowSoftHyphens: true,
+                        child: RepaintBoundary(
+                          child: SizedBox.expand(
+                            child: SinglePageView(
+                              page: page,
+                              lineSpacing: 0,
+                              allowSoftHyphens: true,
+                            ),
                           ),
                         ),
                       );
@@ -122,8 +143,8 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
 
     return MultiColumnPage(
       columns: [layout.lines],
-      pageWidth: contentWidth,     // ширина области рисования
-      pageHeight: contentHeight,   // ВАЖНО: высота области рисования = без паддингов
+      pageWidth: contentWidth,
+      pageHeight: contentHeight,
       columnWidth: contentWidth,
       columnSpacing: 0,
     );
