@@ -150,3 +150,4 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
     );
   }
 }
+
