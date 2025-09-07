@@ -17,6 +17,10 @@ class TextInlineElement extends InlineElement{
   //   // TODO: implement getInteractiveRects
   //   throw UnimplementedError();
   // }
+  @override
+  String toString() {
+    return "TextInlineElement{text: $text}";
+  }
 
   @override
   void paint(Canvas canvas, Offset offset) {

@@ -24,7 +24,7 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
   final PageController _pageCtrl = PageController();
 
   int _currentIndex = 0;
-  Orientation? _lastOrientation;
+  Orientation? _lastOrientation = Orientation.portrait;
 
   static const EdgeInsets _contentPad =
   EdgeInsets.symmetric(horizontal: 20, vertical: 28);
@@ -128,12 +128,15 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
       body: SafeArea(
         child: OrientationBuilder(
           builder: (ctx, orientation) {
+
             if (_lastOrientation != orientation) {
               _lastOrientation = orientation;
               final anchor = controller.anchorForPage(_currentIndex);
+              //вызывает баг
               WidgetsBinding.instance.addPostFrameCallback((_) async {
                 await controller.reflow(context, preserve: anchor);
-                if (mounted) {
+                if (mounted ) {
+
                   _pageCtrl.jumpToPage(0);
                   _currentIndex = 0;
                 }

@@ -22,17 +22,19 @@ import '../../../engine/elements/data_blocks/block_text.dart';
 class ReaderAnchor {
   final int blockIndex;
   final int charOffset;
+
   const ReaderAnchor(this.blockIndex, this.charOffset);
 }
 
 @LazySingleton()
 class ReaderPagerController {
   final XmlLoader xmlLoader;
+
   ReaderPagerController(this.xmlLoader);
 
   final totalPages = signal<int>(0);
 
-  late List<BlockText> _blocks;
+   List<BlockText> _blocks = [];
   late Map<String, Uint8List> _binaries;
   final Map<String, ui.Image> _imgCache = {};
 
@@ -40,11 +42,14 @@ class ReaderPagerController {
   final List<_PageAnchor> _anchors = [];
   final Map<int, Future<void>> _inflight = {};
 
-  bool _inited = false;
+  bool inited = false;
 
   static const _baseFontSize = 16.0;
-  static const _lineHeight   = 1.6;
-  static const _pagePadding  = EdgeInsets.symmetric(horizontal: 20, vertical: 28);
+  static const _lineHeight = 1.6;
+  static const _pagePadding = EdgeInsets.symmetric(
+    horizontal: 20,
+    vertical: 28,
+  );
 
   /* API */
 
@@ -61,18 +66,23 @@ class ReaderPagerController {
     _inflight.clear();
     _anchors
       ..clear()
-      ..add(_PageAnchor(blockIndex: keep.blockIndex, charOffset: keep.charOffset));
+      ..add(
+        _PageAnchor(blockIndex: keep.blockIndex, charOffset: keep.charOffset),
+      );
     totalPages.value = 1;
     await Future.wait([ensurePage(context, 0), ensurePage(context, 1)]);
   }
 
   Future<void> init(BuildContext context) async {
-    if (_inited) return;
-    _inited = true;
+    if (inited) return;
+    inited = true;
 
     final xml = XmlDocument.parse(await xmlLoader.loadBook());
     final transformer = Fb2Transformer();
-    _blocks   = transformer.parseToBlocks(xml.rootElement);
+    _blocks = transformer.parseToBlocks(xml.rootElement);
+    _blocks.take(5).forEach((a) {
+      print("block@:${a}");
+    });
     _binaries = extractBinaryMap(xml);
 
     _anchors.add(const _PageAnchor(blockIndex: 0, charOffset: 0));
@@ -87,12 +97,21 @@ class ReaderPagerController {
     if (pageIndex < 0) return;
 
     final infl = _inflight[pageIndex];
-    if (infl != null) { await infl; return; }
+
+    if (infl != null) {
+      await infl;
+      return;
+    }
+    print("pageindex ${pageIndex}");
 
     while (pageIndex >= _anchors.length) {
       final lastIdx = _anchors.length - 1;
-      final before  = _anchors.length;
-      final fut = _buildAndCachePage(context, lastIdx, computeNextAnchorOnly: true);
+      final before = _anchors.length;
+      final fut = _buildAndCachePage(
+        context,
+        lastIdx,
+        computeNextAnchorOnly: true,
+      );
       _inflight[lastIdx] = fut;
       await fut.whenComplete(() => _inflight.remove(lastIdx));
       if (_anchors.length == before) break;
@@ -105,9 +124,15 @@ class ReaderPagerController {
     await fut2.whenComplete(() => _inflight.remove(pageIndex));
   }
 
-  Future<void> prefetchAround(BuildContext ctx, int index, {int radius = 2}) async {
+  Future<void> prefetchAround(
+    BuildContext ctx,
+    int index, {
+    int radius = 2,
+  }) async {
     for (int i = index - radius; i <= index + radius; i++) {
-      if (i >= 0) { await ensurePage(ctx, i); }
+      if (i >= 0) {
+        await ensurePage(ctx, i);
+      }
     }
   }
 
@@ -147,11 +172,13 @@ class ReaderPagerController {
     );
 
     if (block.tag == 'empty-line') {
-      paragraphs.add(ParagraphBlock(
-        inlineElements: const [],
-        textAlign: TextAlign.start,
-        paragraphSpacing: s.paragraphSpacing,
-      ));
+      paragraphs.add(
+        ParagraphBlock(
+          inlineElements: const [],
+          textAlign: TextAlign.start,
+          paragraphSpacing: s.paragraphSpacing,
+        ),
+      );
       metas.add(_ParaMeta(blockIndex, 0, 0));
       return;
     }
@@ -160,45 +187,52 @@ class ReaderPagerController {
       final img = await _resolveImageForAttrs(block.attrs);
       if (img != null) {
         final mq = MediaQuery.of(context);
-        final safeH   = mq.size.height - mq.padding.top - mq.padding.bottom;
+        final safeH = mq.size.height - mq.padding.top - mq.padding.bottom;
         final usableH = safeH - _pagePadding.vertical;
-        final maxH    = (usableH * 0.9).clamp(1.0, double.infinity);
+        final maxH = (usableH * 0.9).clamp(1.0, double.infinity);
 
-        paragraphs.add(ParagraphBlock(
-          inlineElements: [
-            ImageInlineElement(
-              image: img,
-              maxHeight: maxH,
-              radius: BorderRadius.circular(8),
-            ),
-          ],
-          textAlign: s.textAlign,
-          paragraphSpacing: s.paragraphSpacing,
-          enableRedLine: false,
-          firstLineIndent: 0,
-          maxWidth: s.containerWidthFactor ?? 0.92,
-          containerAlignment: s.containerAlign ?? TextAlign.center,
-        ));
+        paragraphs.add(
+          ParagraphBlock(
+            inlineElements: [
+              ImageInlineElement(
+                image: img,
+                maxHeight: maxH,
+                radius: BorderRadius.circular(8),
+              ),
+            ],
+            textAlign: s.textAlign,
+            paragraphSpacing: s.paragraphSpacing,
+            enableRedLine: false,
+            firstLineIndent: 0,
+            maxWidth: s.containerWidthFactor ?? 0.92,
+            containerAlignment: s.containerAlign ?? TextAlign.center,
+          ),
+        );
       }
       metas.add(_ParaMeta(blockIndex, 0, 0));
       return;
     }
 
     final totalLen = inlineTextTotalLength(block.inlines);
-    final full     = buildInlineElements(block.inlines, s.textStyle);
-    final sliced   = sliceInlineElementsFromStart(full, skipCharsFromStart);
+    final full = buildInlineElements(block.inlines, s.textStyle);
+    final sliced = sliceInlineElementsFromStart(full, skipCharsFromStart);
+    print("sliced ${skipCharsFromStart} $sliced");
+    paragraphs.add(
+      ParagraphBlock(
+        inlineElements: sliced,
+        textAlign: s.textAlign,
+        paragraphSpacing: s.paragraphSpacing,
+        enableRedLine:skipCharsFromStart!=0?false: s.enableRedLine,
+        firstLineIndent: s.firstLineIndent,
+        maxWidth: s.containerWidthFactor,
+        containerAlignment: s.containerAlign,
+      ),
+    );
 
-    paragraphs.add(ParagraphBlock(
-      inlineElements: sliced,
-      textAlign: s.textAlign,
-      paragraphSpacing: s.paragraphSpacing,
-      enableRedLine: s.enableRedLine,
-      firstLineIndent: s.firstLineIndent,
-      maxWidth: s.containerWidthFactor,
-      containerAlignment: s.containerAlign,
-    ));
-
-    final textLenAfterSlice = (totalLen - skipCharsFromStart).clamp(0, totalLen);
+    final textLenAfterSlice = (totalLen - skipCharsFromStart).clamp(
+      0,
+      totalLen,
+    );
     metas.add(_ParaMeta(blockIndex, skipCharsFromStart, textLenAfterSlice));
   }
 
@@ -250,7 +284,10 @@ class ReaderPagerController {
 
     final blLen = inlineTextTotalLength(_blocks[current.blockIndex].inlines);
     if (current.charOffset < blLen) {
-      return _PageAnchor(blockIndex: current.blockIndex, charOffset: current.charOffset + 1);
+      return _PageAnchor(
+        blockIndex: current.blockIndex,
+        charOffset: current.charOffset + 1,
+      );
     }
     if (current.blockIndex + 1 < _blocks.length) {
       return _PageAnchor(blockIndex: current.blockIndex + 1, charOffset: 0);
@@ -259,33 +296,33 @@ class ReaderPagerController {
   }
 
   Future<void> _buildAndCachePage(
-      BuildContext context,
-      int pageIndex, {
-        bool computeNextAnchorOnly = false,
-      }) async {
+    BuildContext context,
+    int pageIndex, {
+    bool computeNextAnchorOnly = false,
+  }) async {
     if (pageIndex < 0 || pageIndex >= _anchors.length) return;
 
     final mq = MediaQuery.of(context);
-    final safeWidth  = mq.size.width  - mq.padding.left - mq.padding.right;
-    final safeHeight = mq.size.height - mq.padding.top  - mq.padding.bottom;
+    final safeWidth = mq.size.width - mq.padding.left - mq.padding.right;
+    final safeHeight = mq.size.height - mq.padding.top - mq.padding.bottom;
 
-    final usableWidth  = safeWidth  - _pagePadding.horizontal;
+    final usableWidth = safeWidth - _pagePadding.horizontal;
     final usableHeight = safeHeight - _pagePadding.vertical;
 
     final start = _anchors[pageIndex];
 
     final paragraphs = <ParagraphBlock>[];
-    final metas      = <_ParaMeta>[];
+    final metas = <_ParaMeta>[];
 
-    int bi       = start.blockIndex;
+    int bi = start.blockIndex;
     int skipHere = start.charOffset;
 
     CustomTextLayout? layout;
-    List<LineLayout>  visibleLines = [];
+    List<LineLayout> visibleLines = [];
     double usedHeight = 0;
 
-    int prevVisibleCount = -1;       // ← контроль прогресса
-    int stagnantIters    = 0;        // ← защита от зависаний
+    int prevVisibleCount = -1; // ← контроль прогресса
+    int stagnantIters = 0; // ← защита от зависаний
     const int kMaxStagnantIters = 2; // допустим 2 итерации без роста
 
     while (bi < _blocks.length) {
@@ -309,7 +346,7 @@ class ReaderPagerController {
       layout = engine.layoutAllParagraphs();
 
       visibleLines = [];
-      usedHeight   = 0;
+      usedHeight = 0;
       for (final line in layout.lines) {
         final h = line.height;
         if (usedHeight + h > usableHeight && visibleLines.isNotEmpty) break;
@@ -337,31 +374,35 @@ class ReaderPagerController {
     _PageAnchor? nextAnchor;
 
     if (visibleLines.isEmpty) {
-      final lastBlock = metas.isNotEmpty ? metas.last.blockIndex : start.blockIndex;
+      final lastBlock = metas.isNotEmpty
+          ? metas.last.blockIndex
+          : start.blockIndex;
       final nb = lastBlock + 1;
-      nextAnchor = (nb < _blocks.length) ? _PageAnchor(blockIndex: nb, charOffset: 0) : null;
+      nextAnchor = (nb < _blocks.length)
+          ? _PageAnchor(blockIndex: nb, charOffset: 0)
+          : null;
     } else {
       final pidx = layout.paragraphIndexOfLine;
       final lastVisibleLineIndex = visibleLines.length - 1;
-      final lastParaIndex        = pidx[lastVisibleLineIndex];
+      final lastParaIndex = pidx[lastVisibleLineIndex];
 
-      final totalLinesPerPara = <int,int>{};
+      final totalLinesPerPara = <int, int>{};
       for (final idx in pidx) {
         totalLinesPerPara[idx] = (totalLinesPerPara[idx] ?? 0) + 1;
       }
-      final visibleLinesPerPara = <int,int>{};
+      final visibleLinesPerPara = <int, int>{};
       for (int i = 0; i <= lastVisibleLineIndex; i++) {
         final pid = pidx[i];
         visibleLinesPerPara[pid] = (visibleLinesPerPara[pid] ?? 0) + 1;
       }
 
-      final totalInLast   = totalLinesPerPara[lastParaIndex] ?? 0;
+      final totalInLast = totalLinesPerPara[lastParaIndex] ?? 0;
       final visibleInLast = visibleLinesPerPara[lastParaIndex] ?? 0;
       final bool hasInvisibleParas = lastParaIndex < (paragraphs.length - 1);
 
-      final bool lastParaIsImage = paragraphs[lastParaIndex]
-          .inlineElements
-          .any((e) => e is ImageInlineElement);
+      final bool lastParaIsImage = paragraphs[lastParaIndex].inlineElements.any(
+        (e) => e is ImageInlineElement,
+      );
 
       if (lastParaIsImage) {
         final meta = metas[lastParaIndex];
@@ -378,14 +419,17 @@ class ReaderPagerController {
           endLineInclusive: lastVisibleLineIndex,
         );
 
-        final endsWithHyphen = _lineEndsWithDrawnHyphen(visibleLines[lastVisibleLineIndex]);
+        final endsWithHyphen = _lineEndsWithDrawnHyphen(
+          visibleLines[lastVisibleLineIndex],
+        );
         if (endsWithHyphen && charsInLastParaVisible > 0) {
           charsInLastParaVisible -= 1;
         }
 
         final paraText = _concatParagraphText(paragraphs[lastParaIndex]);
         bool breaksInsideWord = false;
-        if (charsInLastParaVisible > 0 && charsInLastParaVisible < paraText.length) {
+        if (charsInLastParaVisible > 0 &&
+            charsInLastParaVisible < paraText.length) {
           final prevCU = paraText.codeUnitAt(charsInLastParaVisible - 1);
           final nextCU = paraText.codeUnitAt(charsInLastParaVisible);
           breaksInsideWord = _isWordCU(prevCU) && _isWordCU(nextCU);
@@ -461,7 +505,9 @@ class ReaderPagerController {
     final pageLayout = CustomTextLayout(
       lines: visibleLines,
       totalHeight: usedHeight,
-      paragraphIndexOfLine: layout.paragraphIndexOfLine.take(visibleLines.length).toList(),
+      paragraphIndexOfLine: layout.paragraphIndexOfLine
+          .take(visibleLines.length)
+          .toList(),
     );
     _pageCache[pageIndex] = pageLayout;
 
@@ -478,6 +524,7 @@ class ReaderPagerController {
   /* helpers */
 
   final RegExp _wordCharRe = RegExp(r'[A-Za-zА-Яа-яЁё0-9]');
+
   bool _isWordCU(int cu) => _wordCharRe.hasMatch(String.fromCharCode(cu));
 
   String _concatParagraphText(ParagraphBlock p) {
@@ -493,11 +540,13 @@ class _ParaMeta {
   final int blockIndex;
   final int startOffsetInBlock;
   final int textLen;
+
   const _ParaMeta(this.blockIndex, this.startOffsetInBlock, this.textLen);
 }
 
 class _PageAnchor {
   final int blockIndex;
   final int charOffset;
+
   const _PageAnchor({required this.blockIndex, required this.charOffset});
 }
