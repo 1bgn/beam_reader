@@ -57,6 +57,7 @@ class ReaderPagerController {
   static const _baseFontSize = 16.0;
   static const _lineHeight = 1.6;
   static const _pagePadding = EdgeInsets.symmetric(horizontal: 20, vertical: 28);
+  double _extraBottomPad = 32;
 
   /* ===== Indices & helpers ===== */
   // char prefix for slider (быстрый прыжок по процентам)
@@ -378,7 +379,7 @@ class ReaderPagerController {
     final safeHeight = mq.size.height - mq.padding.top  - mq.padding.bottom;
 
     final usableWidth  = safeWidth  - _pagePadding.horizontal;
-    final usableHeight = safeHeight - _pagePadding.vertical;
+    final usableHeight = safeHeight - _pagePadding.vertical-_extraBottomPad;
 
     final paragraphs = <ParagraphBlock>[];
     final metas = <_ParaMeta>[];
@@ -638,7 +639,7 @@ class ReaderPagerController {
       if (img != null) {
         final mq = MediaQuery.of(context);
         final safeH = mq.size.height - mq.padding.top - mq.padding.bottom;
-        final usableH = safeH - _pagePadding.vertical;
+        final usableH = safeH - _pagePadding.vertical-_extraBottomPad;
         final maxH = (usableH * 0.9).clamp(1.0, double.infinity);
 
         paragraphs.add(
