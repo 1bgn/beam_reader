@@ -20,7 +20,6 @@ import 'package:beam_reader/engine/elements/text_utils.dart';
 import 'package:beam_reader/engine/elements/data_blocks/block_text.dart';
 import 'package:beam_reader/engine/fb2_transform.dart';
 
-/// Совместимость с UI: якорь «позиции в тексте»
 class ReaderAnchor {
   final int blockIndex;
   final int charOffset;
@@ -32,28 +31,22 @@ class ReaderPagerController {
   final XmlLoader xmlLoader;
   ReaderPagerController(this.xmlLoader);
 
-  /* ===== Сигналы ===== */
   final totalPages = signal<int>(0);
 
-  /* ===== Книга ===== */
   List<BlockText> _blocks = [];
   late Map<String, Uint8List> _binaries;
   final Map<String, ui.Image> _imgCache = {};
 
-  /* ===== Кэш страниц ===== */
   final List<CustomTextLayout> _pages = [];
-  final List<_Cursor> _pageStarts = []; // откуда начиналась страница i
-  final List<_Cursor> _pageEnds   = []; // где закончилась страница i
-  _Cursor _cursor = const _Cursor(blockIndex: 0, charOffset: 0); // старт для следующей вперёд
+  final List<_Cursor> _pageStarts = [];
+  final List<_Cursor> _pageEnds   = [];
+  _Cursor _cursor = const _Cursor(blockIndex: 0, charOffset: 0);
 
   bool inited = false;
 
-  /* ===== Параметры верстки ===== */
   static const _baseFontSize = 16.0;
   static const _lineHeight = 1.6;
   static const _pagePadding = EdgeInsets.symmetric(horizontal: 20, vertical: 28);
-
-  /* ========================= API ========================= */
 
   Future<void> init(BuildContext context) async {
     if (inited) return;
@@ -69,53 +62,80 @@ class ReaderPagerController {
     await ensurePage(context, 1);
   }
 
-  /// Возврат стартового курсора страницы (совместимость).
   ReaderAnchor anchorForPage(int index) {
     if (index < 0 || index >= _pageStarts.length) return const ReaderAnchor(0, 0);
     final c = _pageStarts[index];
     return ReaderAnchor(c.blockIndex, c.charOffset);
   }
 
-  /// Полный пересчёт. Построит страницы вперёд от preserve и **backfill** страниц назад.
-  /// Возвращает индекс страницы, на которую стоит перейти после пересчёта.
-  Future<int> reflow(BuildContext context, {ReaderAnchor? preserve, int backfill = 3}) async {
+  Future<int> reflow(BuildContext context, {ReaderAnchor? preserve, int backfill = 0}) async {
+    // 1) если якорь не передан — считаем, что это начало
     final keep = preserve ?? const ReaderAnchor(0, 0);
-    _resetPagination(keep);
 
-    // Сначала строим «текущую» и следующую вперёд — чтобы показать экран
-    await ensurePage(context, 0);
-    await ensurePage(context, 1);
+    // 2) ПОЛНЫЙ пересчёт ВПЕРЁД ОТ НАЧАЛА, чтобы восстановить все предыдущие страницы
+    _resetPagination(const ReaderAnchor(0, 0));
 
-    // Затем достроим несколько страниц НАЗАД, чтобы пользователь мог листать влево
-    int builtBack = 0;
-    for (; builtBack < backfill; builtBack++) {
-      final prev = await _buildPrevPage(context, _pageStarts.isEmpty ? _cursor : _pageStarts.first);
-      if (prev == null) break;
-      // prepend
-      _pages.insert(0, prev.layout);
-      _pageStarts.insert(0, prev.start);
-      _pageEnds.insert(0, prev.end);
-    }
-    if (builtBack > 0) {
+    final wanted = _Cursor(blockIndex: keep.blockIndex, charOffset: keep.charOffset);
+    int targetIndex = 0;
+
+    while (true) {
+      // если уже есть страницы и последняя "накрыла" якорь — останавливаемся
+      if (_pages.isNotEmpty) {
+        final st = _pageStarts.last;
+        final ed = _pageEnds.last; // end — курсор продолжения НЕ РАНЬШЕ конца страницы
+        final stLeWanted = !_isAfter(st, wanted);       // st <= wanted
+        final wantedLeEd = !_isAfter(wanted, ed);       // wanted <= ed
+        if (stLeWanted && wantedLeEd) {
+          targetIndex = _pages.length - 1;
+          break;
+        }
+        // если уже прошли якорь (редкий случай) — ставим на предыдущую
+        if (_isAfter(st, wanted)) {
+          targetIndex = (_pages.length - 2).clamp(0, _pages.length - 1);
+          break;
+        }
+      }
+
+      final before = _cursor;
+      final built = await _buildNextPage(context, _cursor);
+      if (built == null) break; // дошли до конца книги
+
+      // инварианты против дублей
+      if (!_isAfter(built.end, before)) break;
+      if (_pageEnds.isNotEmpty && !_isAfter(built.end, _pageEnds.last)) break;
+
+      _pageStarts.add(before);
+      _pages.add(built.layout);
+      _pageEnds.add(built.end);
+      _cursor = built.end;
       totalPages.value = _pages.length;
     }
 
-    // вернуть индекс «текущей» страницы с учетом префикса
-    return builtBack;
+    // на всякий: подстроим ещё одну страницу вперёд для плавности
+    await ensurePage(context, targetIndex + 1);
+
+    return targetIndex;
   }
 
   CustomTextLayout? getPage(int index) =>
       (index >= 0 && index < _pages.length) ? _pages[index] : null;
 
-  /// Лениво гарантирует наличие страницы.
   Future<void> ensurePage(BuildContext context, int pageIndex) async {
     if (pageIndex < 0) return;
     if (pageIndex < _pages.length) return;
 
     while (_pages.length <= pageIndex) {
+      final before = _cursor;
       final built = await _buildNextPage(context, _cursor);
       if (built == null) break;
-      _pageStarts.add(_cursor);
+
+      // FIX: если страница не продвинула курсор — прекращаем (иначе дубликаты)
+      if (!_isAfter(built.end, before)) break;
+
+      // FIX: если есть предыдущая страница и её конец не меньше нового конца — тоже не добавляем
+      if (_pageEnds.isNotEmpty && !_isAfter(built.end, _pageEnds.last)) break;
+
+      _pageStarts.add(before);
       _pages.add(built.layout);
       _pageEnds.add(built.end);
       _cursor = built.end;
@@ -131,7 +151,7 @@ class ReaderPagerController {
     }
   }
 
-  /* ====================== Внутренности ====================== */
+  /* ====================== helpers & invariants ====================== */
 
   void _resetPagination(ReaderAnchor anchor) {
     _pages.clear();
@@ -154,15 +174,33 @@ class ReaderPagerController {
     return inlineTextTotalLength(b.inlines) == 0;
   }
 
+  bool _cursorEq(_Cursor a, _Cursor b) =>
+      a.blockIndex == b.blockIndex && a.charOffset == b.charOffset;
+
   bool _isAfter(_Cursor a, _Cursor b) =>
       (a.blockIndex > b.blockIndex) ||
           (a.blockIndex == b.blockIndex && a.charOffset > b.charOffset);
 
-  bool _isAfterOrEq(_Cursor a, _Cursor b) =>
-      a.blockIndex > b.blockIndex ||
-          (a.blockIndex == b.blockIndex && a.charOffset >= b.charOffset);
+  // FIX: гарантированное продвижение минимум на 1 символ/блок
+  _Cursor _forceAdvanceAfter(_Cursor candidate, _Cursor current) {
+    if (_isAfter(candidate, current)) return candidate;
 
-  /* ---------- ресурсы изображений ---------- */
+    // попробуем сдвинуться на 1 символ в текущем блоке
+    if (current.blockIndex < _blocks.length) {
+      final len = inlineTextTotalLength(_blocks[current.blockIndex].inlines);
+      if (current.charOffset < len) {
+        return _Cursor(blockIndex: current.blockIndex, charOffset: current.charOffset + 1);
+      }
+    }
+    // иначе — в начало следующего блока
+    if (current.blockIndex + 1 < _blocks.length) {
+      return _Cursor(blockIndex: current.blockIndex + 1, charOffset: 0);
+    }
+    // уже конец книги — возвращаем current, upstream отфильтрует бездействие
+    return current;
+  }
+
+  /* ---------- images ---------- */
 
   Future<ui.Image?> _resolveImageForAttrs(Map<String, String>? attrs) async {
     if (attrs == null) return null;
@@ -258,6 +296,10 @@ class ReaderPagerController {
     metas.add(_ParaMeta(blockIndex, skipCharsFromStart, textLenAfterSlice));
   }
 
+  /* слово/перенос */
+  final RegExp _wordCharRe = RegExp(r'[A-Za-zА-Яа-яЁё0-9]');
+  bool _isWordCU(int cu) => _wordCharRe.hasMatch(String.fromCharCode(cu));
+
   bool _lineEndsWithDrawnHyphen(LineLayout line) {
     for (int i = line.elements.length - 1; i >= 0; i--) {
       final e = line.elements[i];
@@ -303,7 +345,7 @@ class ReaderPagerController {
     return sb.toString();
   }
 
-  /* ===================== Построение страниц вперёд ===================== */
+  /* ===================== build forward page ===================== */
 
   Future<_BuiltPage?> _buildNextPage(BuildContext context, _Cursor start) async {
     if (start.blockIndex >= _blocks.length) return null;
@@ -383,7 +425,6 @@ class ReaderPagerController {
 
     if (layout == null) return null;
 
-    // --- конец страницы (куда продолжать дальше) ---
     late _Cursor endCursor;
 
     if (visible.isEmpty) {
@@ -433,8 +474,7 @@ class ReaderPagerController {
         if (charsVisible > 0 && charsVisible < paraText.length) {
           final prevCU = paraText.codeUnitAt(charsVisible - 1);
           final nextCU = paraText.codeUnitAt(charsVisible);
-          bool isWord(int cu) => RegExp(r'[A-Za-zА-Яа-яЁё0-9]').hasMatch(String.fromCharCode(cu));
-          breaksInsideWord = isWord(prevCU) && isWord(nextCU);
+          breaksInsideWord = _isWordCU(prevCU) && _isWordCU(nextCU);
         }
 
         if ((breaksInsideWord || endsWithHyphen) && visible.length > 1) {
@@ -450,6 +490,10 @@ class ReaderPagerController {
             blockIndex: meta.blockIndex,
             charOffset: meta.startOffsetInBlock + charsBeforeLastLine,
           );
+
+          // визуально отрезаем последнюю линию
+          usedH -= visible[lastLine].height;
+          visible = visible.sublist(0, lastLine);
         } else {
           final meta = metas[lastPara];
           endCursor = _Cursor(
@@ -469,6 +513,15 @@ class ReaderPagerController {
       }
     }
 
+    // FIX: жёсткая гарантия продвижения (никаких end == start)
+    endCursor = _forceAdvanceAfter(endCursor, start);
+
+    // если после «среза» последней строки вдруг всё опустело — это пустая страница, пропускаем
+    if (visible.isEmpty) {
+      // позволим внешнему уровню отфильтровать отсутствие прогресса
+      if (!_isAfter(endCursor, start)) return null;
+    }
+
     final pageLayout = CustomTextLayout(
       lines: visible,
       totalHeight: usedH,
@@ -478,41 +531,35 @@ class ReaderPagerController {
     return _BuiltPage(pageLayout, endCursor);
   }
 
-  /* ===================== Построение предыдущей страницы ===================== */
-  /// Строит страницу, которая заканчивается ровно в `currentStart` (или как можно ближе перед ним).
-  /// Возвращает layout и пару курсоров: start..end (end ~= currentStart).
+  /* ===================== build previous page (approx) ===================== */
   Future<_BuiltPrevPage?> _buildPrevPage(BuildContext context, _Cursor currentStart) async {
     if (currentStart.blockIndex <= 0 && currentStart.charOffset <= 0) return null;
 
-    // Поищем старт не дальше, чем на 40 блоков назад — дешево и сердито.
     const int kMaxLookbackBlocks = 40;
     final int minStart = (currentStart.blockIndex - kMaxLookbackBlocks).clamp(0, _blocks.length);
 
-    _BuiltPage? lastBefore; // последний, чей end <= currentStart
+    _BuiltPage? lastBefore;
+    int lastBeforeStartIdx = -1;
+
     for (int si = minStart; si <= currentStart.blockIndex; si++) {
       final built = await _buildNextPage(context, _Cursor(blockIndex: si, charOffset: 0));
       if (built == null) break;
 
       if (_isAfter(built.end, currentStart)) {
-        // Переступили границу — предыдущий был лучшим кандидатом
         if (lastBefore == null) {
-          // крайний случай: даже с minStart страница вышла дальше currentStart.
-          // Тогда вернём её — пользователь всё равно увидит максимально возможный объем.
           return _BuiltPrevPage(
             layout: built.layout,
             start: _Cursor(blockIndex: si, charOffset: 0),
             end: built.end,
           );
         } else {
-          final startIdx = (si - 1).clamp(0, _blocks.length);
           return _BuiltPrevPage(
             layout: lastBefore.layout,
-            start: _Cursor(blockIndex: startIdx, charOffset: 0),
+            start: _Cursor(blockIndex: lastBeforeStartIdx, charOffset: 0),
             end: lastBefore.end,
           );
         }
-      } else if (_isAfterOrEq(built.end, currentStart)) {
-        // Закончились ровно на нужной позиции
+      } else if (_cursorEq(built.end, currentStart)) {
         return _BuiltPrevPage(
           layout: built.layout,
           start: _Cursor(blockIndex: si, charOffset: 0),
@@ -520,14 +567,11 @@ class ReaderPagerController {
         );
       }
 
-      lastBefore = built; // пока страница заканчивается раньше — запомним
+      lastBefore = built;
+      lastBeforeStartIdx = si;
     }
 
-    // Если цикл закончился и мы так и не переступили — берём последний вариант «до»
     if (lastBefore != null) {
-      final bestStart = (currentStart.blockIndex).clamp(0, _blocks.length);
-      // start у lastBefore соответствует тому si, на котором он строился — мы не сохранили его.
-      // Для простоты пересчитаем ещё раз.
       for (int si = currentStart.blockIndex; si >= minStart; si--) {
         final probe = await _buildNextPage(context, _Cursor(blockIndex: si, charOffset: 0));
         if (probe == null) break;
@@ -545,7 +589,7 @@ class ReaderPagerController {
   }
 }
 
-/* ======================= Вспомогательные типы ======================= */
+/* ======================= types ======================= */
 
 class _Cursor {
   final int blockIndex;
@@ -563,11 +607,7 @@ class _BuiltPrevPage {
   final CustomTextLayout layout;
   final _Cursor start;
   final _Cursor end;
-  _BuiltPrevPage({
-    required this.layout,
-    required this.start,
-    required this.end,
-  });
+  _BuiltPrevPage({required this.layout, required this.start, required this.end});
 }
 
 class _ParaMeta {

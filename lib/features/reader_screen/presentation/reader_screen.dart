@@ -54,7 +54,6 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
 
     _isAnimating = true;
 
-    // лениво подготавливаем цель
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       controller.ensurePage(context, target);
@@ -103,25 +102,21 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
       body: SafeArea(
         child: OrientationBuilder(
           builder: (ctx, orientation) {
-            // обработка смены ориентации: пересчет и восстановление "назад"
             if (_lastOrientation != orientation) {
               _lastOrientation = orientation;
               final anchor = controller.anchorForPage(_currentIndex);
 
+              // ВАЖНО: рефлоу возвращает правильный индекс текущей страницы
               WidgetsBinding.instance.addPostFrameCallback((_) async {
-                final startIndex =
-                await controller.reflow(context, preserve: anchor, backfill: 3);
+                final newIndex = await controller.reflow(context, preserve: anchor);
                 if (!mounted) return;
+                _pageCtrl.jumpToPage(newIndex);
+                _currentIndex = newIndex;
 
-                // ставим PageView на корректную страницу (учтен backfill)
-                _pageCtrl.jumpToPage(startIndex);
-                _currentIndex = startIndex;
-
-                // подгрузим окрестности
                 WidgetsBinding.instance.addPostFrameCallback((_) {
                   if (!mounted) return;
-                  controller.ensurePage(context, startIndex);
-                  controller.prefetchAround(context, startIndex, radius: 2);
+                  controller.ensurePage(context, newIndex + 1);
+                  controller.prefetchAround(context, newIndex, radius: 2);
                 });
               });
             }
@@ -136,19 +131,19 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
                     return const Center(child: CircularProgressIndicator());
                   }
 
-                  // только свайпы (PageView) и клавиатура — никаких mouse/trackpad listeners
+                  // Только свайпы и клавиатура
                   return Focus(
                     autofocus: true,
                     onKeyEvent: (node, event) => _handleKey(event),
                     child: PageView.builder(
                       controller: _pageCtrl,
-                      physics: const PageScrollPhysics(), // свайпы
+                      physics: const PageScrollPhysics(),
                       allowImplicitScrolling: true,
                       onPageChanged: (i) {
                         _currentIndex = i;
                         WidgetsBinding.instance.addPostFrameCallback((_) {
                           if (!mounted) return;
-                          controller.ensurePage(context, i);
+                          controller.ensurePage(context, i + 1);
                           controller.prefetchAround(context, i, radius: 2);
                         });
                       },
