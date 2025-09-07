@@ -25,7 +25,7 @@ class ReaderAnchor {
   const ReaderAnchor(this.blockIndex, this.charOffset);
 }
 
-/// Устойчивый якорь: начало абзаца (id) + offset (мы используем offset=0)
+/// Устойчивый якорь: начало абзаца (id) + offset (используем 0)
 class ReaderIdAnchor {
   final String blockId;
   final int charOffset;
@@ -48,8 +48,8 @@ class ReaderPagerController {
   /* ===== Pages cache (deque) ===== */
   final List<CustomTextLayout> _pages = [];
   final List<_Cursor> _pageStarts = []; // включительно
-  final List<_Cursor> _pageEnds   = []; // эксклюзивно (куда продолжать дальше)
-  _Cursor _cursor = const _Cursor(blockIndex: 0, charOffset: 0); // where to build next forward
+  final List<_Cursor> _pageEnds   = []; // эксклюзивно
+  _Cursor _cursor = const _Cursor(blockIndex: 0, charOffset: 0); // build next forward from here
 
   bool inited = false;
 
@@ -57,28 +57,29 @@ class ReaderPagerController {
   static const _baseFontSize = 16.0;
   static const _lineHeight = 1.6;
   static const _pagePadding = EdgeInsets.symmetric(horizontal: 20, vertical: 28);
-  double _extraBottomPad = 32;
 
-  /* ===== Indices & helpers ===== */
-  // char prefix for slider (быстрый прыжок по процентам)
+  /* ===== Indices ===== */
   late List<int> _charPrefix; // len = _blocks.length + 1
   int _totalChars = 0;
   int get totalChars => _totalChars;
-
   late Map<String, int> _idToBlockIndex;
 
+  /* ====== Prefetch throttling ====== */
+  int _lastPrefetchCenter = -1;
+  int _lastPrefetchAhead = 0;
+
   /* ========================= API ========================= */
+
   double pageStartProgress(int pageIndex) {
     if (_totalChars <= 0) return 0.0;
     if (pageIndex < 0 || pageIndex >= _pageStarts.length) return 0.0;
-
     final _Cursor start = _pageStarts[pageIndex];
-    final int g = _globalCharOfCursor(start); // глобальная позиция начала страницы
+    final int g = _globalCharOfCursor(start);
     if (g <= 0) return 0.0;
     if (g >= _totalChars) return 1.0;
-
     return g / _totalChars;
   }
+
   Future<void> init(BuildContext context) async {
     if (inited) return;
     inited = true;
@@ -95,14 +96,12 @@ class ReaderPagerController {
     await ensurePage(context, 1);
   }
 
-  /// Якорь текущей страницы (для совместимости)
   ReaderAnchor anchorForPage(int index) {
     if (index < 0 || index >= _pageStarts.length) return const ReaderAnchor(0, 0);
     final c = _pageStarts[index];
     return ReaderAnchor(c.blockIndex, c.charOffset);
   }
 
-  /// Устойчивый ID-якорь (начало абзаца)
   ReaderIdAnchor idAnchorForPage(int index) {
     if (index < 0 || index >= _pageStarts.length) {
       final firstId = _blocks.isNotEmpty ? _blocks.first.id : '';
@@ -113,21 +112,15 @@ class ReaderPagerController {
     return ReaderIdAnchor(_blocks[bi].id, 0);
   }
 
-  /// Полный пересчёт вокруг preserve (после поворота). Возвращает индекс текущей страницы.
   Future<int> reflow(BuildContext context, {ReaderAnchor? preserve}) async {
     final keep = preserve ?? const ReaderAnchor(0, 0);
-    // ВАЖНО: якоримся на начало абзаца
     final bi = keep.blockIndex.clamp(0, _blocks.length);
     _resetPagination(ReaderAnchor(bi, 0));
-
     await ensurePage(context, 0);
     await ensurePage(context, 1);
-
-    // ленивое восстановление прошлых будет по требованию (см. lazyEnsurePrev)
     return 0;
   }
 
-  /// Быстрый рефлоу по ID-абзацу. Возвращает индекс текущей.
   Future<int> reflowFromId(BuildContext context, {required ReaderIdAnchor keep}) async {
     final bi = _idToBlockIndex[keep.blockId] ?? 0;
     _resetPagination(ReaderAnchor(bi.clamp(0, _blocks.length), 0));
@@ -139,7 +132,6 @@ class ReaderPagerController {
   CustomTextLayout? getPage(int index) =>
       (index >= 0 && index < _pages.length) ? _pages[index] : null;
 
-  /// Гарантировать наличие страницы index (вперёд)
   Future<void> ensurePage(BuildContext context, int pageIndex) async {
     if (pageIndex < 0) return;
     if (pageIndex < _pages.length) return;
@@ -148,8 +140,6 @@ class ReaderPagerController {
       final before = _cursor;
       final built = await _buildNextPage(context, _cursor);
       if (built == null) break;
-
-      // защита от дублей/застреваний
       if (!_isAfter(built.end, before)) break;
       if (_pageEnds.isNotEmpty && !_isAfter(built.end, _pageEnds.last)) break;
 
@@ -161,25 +151,37 @@ class ReaderPagerController {
     }
   }
 
-  /// Ленивая подгрузка прошлых страниц «по требованию».
-  /// Возвращает, сколько страниц реально добавили слева.
+  /// Неблокирующая предзагрузка страниц вперёд (используется при свайпе).
+  void ensureAhead(BuildContext context, int centerIndex, {int ahead = 3}) {
+    // чтобы не плодить одинаковые запросы
+    if (_lastPrefetchCenter == centerIndex && _lastPrefetchAhead == ahead) return;
+    _lastPrefetchCenter = centerIndex;
+    _lastPrefetchAhead = ahead;
+
+    // запускаем в microtask — не блокируем текущий кадр
+    Future<void>(() async {
+      final want = centerIndex + ahead;
+      await ensurePage(context, want);
+      // небольшое «веерное» добивание: center+1..center+ahead
+      for (int i = centerIndex + 1; i <= want; i++) {
+        await ensurePage(context, i);
+      }
+    });
+  }
+
+  /// Ленивая подгрузка прошлых страниц «влево».
   Future<int> lazyEnsurePrev(BuildContext context, {int want = 1}) async {
     if (_pageStarts.isEmpty) return 0;
 
     int added = 0;
     while (added < want) {
       final currStart = _pageStarts.first;
-
-      // уже в самом начале книги?
       if (currStart.blockIndex <= 0 && currStart.charOffset <= 0) break;
 
-      // ищем старт предыдущей страницы по абзацам:
       final prev = await _buildPrevPageStrictByBlocks(context, currStart.blockIndex);
       if (prev == null) break;
 
-      // корректность: prev.end <= currStart
       if (_isAfter(prev.end, currStart)) {
-        // если вдруг «перешагнули» — попробуем еще на 1 абзац дальше
         final fallback = await _buildPrevPageStrictByBlocks(context, (currStart.blockIndex - 1).clamp(0, _blocks.length));
         if (fallback == null || _isAfter(fallback.end, currStart)) break;
         _pages.insert(0, fallback.layout);
@@ -197,8 +199,6 @@ class ReaderPagerController {
     return added;
   }
 
-  /// Быстрый прыжок по проценту: прыгаем к началу абзаца и строим текущую/следующую.
-  /// Возвращаем индекс текущей (0 — т.к. прошлые лениво подгружаем по требованию).
   Future<int> jumpToPercent(BuildContext context, double percent) async {
     if (_blocks.isEmpty) return 0;
     if (_totalChars <= 0) {
@@ -212,10 +212,13 @@ class ReaderPagerController {
 
     final curSym = _cursorFromGlobalChar(targetGlobal);
     final bi = curSym.blockIndex.clamp(0, _blocks.length);
-    _resetPagination(ReaderAnchor(bi, 0)); // начало абзаца
+    _resetPagination(ReaderAnchor(bi, 0));
 
     await ensurePage(context, 0);
     await ensurePage(context, 1);
+    // сбросим маркеры предзагрузки, чтобы не стопорить ensureAhead после прыжка
+    _lastPrefetchCenter = -1;
+    _lastPrefetchAhead = 0;
     return 0;
   }
 
@@ -251,8 +254,10 @@ class ReaderPagerController {
     _pages.clear();
     _pageStarts.clear();
     _pageEnds.clear();
-    _cursor = _Cursor(blockIndex: anchor.blockIndex, charOffset: 0); // ВАЖНО: начало абзаца
+    _cursor = _Cursor(blockIndex: anchor.blockIndex, charOffset: 0);
     totalPages.value = 0;
+    _lastPrefetchCenter = -1;
+    _lastPrefetchAhead = 0;
   }
 
   int _sectionOfBlock(int bi) {
@@ -275,7 +280,7 @@ class ReaderPagerController {
       (a.blockIndex > b.blockIndex) ||
           (a.blockIndex == b.blockIndex && a.charOffset > b.charOffset);
 
-  /* ---------- global char helpers (для процентной перемотки) ---------- */
+  /* ---------- global char helpers ---------- */
 
   int _globalCharOfCursor(_Cursor c) {
     if (_totalChars == 0) return 0;
@@ -310,15 +315,12 @@ class ReaderPagerController {
 
   /* ---------- build previous page strictly by blocks ---------- */
 
-  /// Строит «предыдущую» страницу: находит максимально правый стартовый абзац s<=currentStartBlock,
-  /// из которого страница вперёд заканчивается не позже currentStartBlock.
   Future<_BuiltPrevPage?> _buildPrevPageStrictByBlocks(BuildContext context, int currentStartBlock) async {
     if (currentStartBlock <= 0) return null;
 
-    final int hi = currentStartBlock;          // верхний абзац текущей страницы
+    final int hi = currentStartBlock;
     int lo = (hi - 1).clamp(0, _blocks.length);
 
-    // экспоненциально расширяем окно назад, пока не найдём start, дающий end <= hi
     int step = 1;
     bool found = false;
     while (true) {
@@ -337,7 +339,6 @@ class ReaderPagerController {
     }
 
     if (!found) {
-      // fallback: один абзац назад
       final start = _Cursor(blockIndex: lo, charOffset: 0);
       final built = await _buildNextPage(context, start);
       if (built == null) return null;
@@ -345,7 +346,6 @@ class ReaderPagerController {
       return _BuiltPrevPage(layout: built.layout, start: start, end: built.end);
     }
 
-    // двоичный поиск максимально правого старта
     int L = lo, R = hi - 1, best = lo;
     while (L <= R) {
       final mid = (L + R) >> 1;
@@ -379,7 +379,7 @@ class ReaderPagerController {
     final safeHeight = mq.size.height - mq.padding.top  - mq.padding.bottom;
 
     final usableWidth  = safeWidth  - _pagePadding.horizontal;
-    final usableHeight = safeHeight - _pagePadding.vertical-_extraBottomPad;
+    final usableHeight = safeHeight - _pagePadding.vertical;
 
     final paragraphs = <ParagraphBlock>[];
     final metas = <_ParaMeta>[];
@@ -537,9 +537,7 @@ class ReaderPagerController {
       }
     }
 
-    // строгое продвижение
     if (!_isAfter(endCursor, start)) {
-      // попробуем хотя бы на следующий блок
       if (start.blockIndex + 1 <= _blocks.length - 1) {
         endCursor = _Cursor(blockIndex: start.blockIndex + 1, charOffset: 0);
       } else {
@@ -556,7 +554,7 @@ class ReaderPagerController {
     return _BuiltPage(pageLayout, endCursor);
   }
 
-  /* ===================== helpers for building content ===================== */
+  /* ===================== helpers ===================== */
 
   final RegExp _wordCharRe = RegExp(r'[A-Za-zА-Яа-яЁё0-9]');
   bool _isWordCU(int cu) => _wordCharRe.hasMatch(String.fromCharCode(cu));
@@ -639,7 +637,7 @@ class ReaderPagerController {
       if (img != null) {
         final mq = MediaQuery.of(context);
         final safeH = mq.size.height - mq.padding.top - mq.padding.bottom;
-        final usableH = safeH - _pagePadding.vertical-_extraBottomPad;
+        final usableH = safeH - _pagePadding.vertical;
         final maxH = (usableH * 0.9).clamp(1.0, double.infinity);
 
         paragraphs.add(

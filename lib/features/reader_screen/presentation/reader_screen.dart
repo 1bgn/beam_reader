@@ -1,9 +1,9 @@
-// lib/features/reader_screen/presentation/paged_reader_screen.dart
 import 'package:beam_reader/di/injectable.dart';
 import 'package:beam_reader/engine/elements/layout_blocks/custom_text_layout.dart';
 import 'package:beam_reader/engine/elements/layout_blocks/multi_column_page.dart';
 import 'package:beam_reader/features/reader_screen/presentation/widgets/single_page_view.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:signals_flutter/signals_flutter.dart';
 
@@ -23,18 +23,13 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
   int _currentIndex = 0;
   Orientation? _lastOrientation = Orientation.portrait;
 
-  // Внутренние паддинги страницы
   static const EdgeInsets _contentPad =
   EdgeInsets.symmetric(horizontal: 20, vertical: 28);
-
-  // Высота панели со слайдером
   static const double _sliderBarHeight = 60;
 
-  // Анимация перелистывания
   static const _kAnimDuration = Duration(milliseconds: 180);
   bool _isAnimating = false;
 
-  // Прогресс-слайдер
   double _progress = 0.0;
   bool _isSeeking = false;
 
@@ -64,11 +59,8 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
 
     _isAnimating = true;
 
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      controller.ensurePage(context, target);
-      controller.prefetchAround(context, target, radius: 2);
-    });
+    // неблокирующая предзагрузка будущих страниц
+    controller.ensureAhead(context, target, ahead: 3);
 
     try {
       await _pageCtrl.animateToPage(
@@ -107,8 +99,6 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
     return KeyEventResult.ignored;
   }
 
-  /// Если на первой/второй странице — лениво расширим влево,
-  /// чтобы было куда листать назад.
   Future<void> _maybeExpandBefore() async {
     if (_currentIndex > 1) return;
     final added = await controller.lazyEnsurePrev(context, want: 3);
@@ -132,8 +122,8 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
       backgroundColor: Colors.white,
       body: Column(
         children: [
-          // Контент: учитываем только верхний системный inset
-          SafeArea(top: true, bottom: false, left: false, right: false, child: const SizedBox.shrink()),
+          // Отдельный SafeArea для верха
+          const SafeArea(top: true, bottom: false, left: false, right: false, child: SizedBox.shrink()),
           Expanded(
             child: OrientationBuilder(
               builder: (ctx, orientation) {
@@ -154,7 +144,7 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
                     WidgetsBinding.instance.addPostFrameCallback((_) {
                       if (!mounted) return;
                       controller.ensurePage(context, newIndex + 1);
-                      controller.prefetchAround(context, newIndex, radius: 2);
+                      controller.ensureAhead(context, newIndex, ahead: 3);
                       _syncSliderWithPage(newIndex);
                     });
                   });
@@ -170,62 +160,83 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
                         return const Center(child: CircularProgressIndicator());
                       }
 
-                      return Focus(
-                        autofocus: true,
-                        onKeyEvent: (node, event) => _handleKey(event),
-                        child: PageView.builder(
-                          controller: _pageCtrl,
-                          physics: const PageScrollPhysics(),
-                          allowImplicitScrolling: true,
-                          onPageChanged: (i) async {
-                            if (i <= 1) {
-                              final added = await controller.lazyEnsurePrev(context, want: 3);
-                              if (added > 0 && mounted && _pageCtrl.hasClients) {
-                                _pageCtrl.jumpToPage(i + added);
-                                _currentIndex = i + added;
-                                _syncSliderWithPage(_currentIndex);
-                                return;
-                              }
+                      return NotificationListener<UserScrollNotification>(
+                        onNotification: (n) {
+                          if (n.direction == ScrollDirection.idle) return false;
+                          // предзагружаем в сторону движения
+                          final dir = n.direction;
+                          if (dir == ScrollDirection.reverse) {
+                            // свайп вперёд
+                            controller.ensureAhead(context, _currentIndex, ahead: 4);
+                          } else if (dir == ScrollDirection.forward) {
+                            // свайп назад: если у края — пытаемся лениво расширить влево
+                            if (_currentIndex <= 1) {
+                              controller.lazyEnsurePrev(context, want: 3);
                             }
+                          }
+                          return false;
+                        },
+                        child: Focus(
+                          autofocus: true,
+                          onKeyEvent: (node, event) => _handleKey(event),
+                          child: PageView.builder(
+                            controller: _pageCtrl,
+                            physics: const PageScrollPhysics(),
+                            allowImplicitScrolling: true,
+                            onPageChanged: (i) async {
+                              if (i <= 1) {
+                                final added = await controller.lazyEnsurePrev(context, want: 3);
+                                if (added > 0 && mounted && _pageCtrl.hasClients) {
+                                  _pageCtrl.jumpToPage(i + added);
+                                  _currentIndex = i + added;
+                                  _syncSliderWithPage(_currentIndex);
+                                  return;
+                                }
+                              }
 
-                            _currentIndex = i;
-                            controller.ensurePage(context, i + 1);
-                            controller.prefetchAround(context, i, radius: 2);
-                            _syncSliderWithPage(i);
-                          },
-                          itemCount: total,
-                          itemBuilder: (ctx, index) {
-                            final layout = controller.getPage(index);
-                            final pad = _contentPad;
+                              _currentIndex = i;
+                              // лёгкая неблокирующая подгрузка вперёд
+                              controller.ensureAhead(context, i, ahead: 4);
+                              _syncSliderWithPage(i);
+                            },
+                            itemCount: total,
+                            itemBuilder: (ctx, index) {
+                              final layout = controller.getPage(index);
+                              final pad = _contentPad;
 
-                            if (layout == null) {
+                              if (layout == null) {
+                                return Padding(
+                                  padding: pad,
+                                  child: const _KeptAlive(
+                                    child: RepaintBoundary(
+                                      child: ColoredBox(color: Colors.white),
+                                    ),
+                                  ),
+                                );
+                              }
+
+                              final page = _buildPageFromLayout(
+                                safeSize,
+                                layout,
+                                pad,
+                              );
+
                               return Padding(
                                 padding: pad,
-                                child: const RepaintBoundary(
-                                  child: ColoredBox(color: Colors.white),
-                                ),
-                              );
-                            }
-
-                            final page = _buildPageFromLayout(
-                              safeSize,
-                              layout,
-                              pad,
-                            );
-
-                            return Padding(
-                              padding: pad,
-                              child: RepaintBoundary(
-                                child: SizedBox.expand(
-                                  child: SinglePageView(
-                                    page: page,
-                                    lineSpacing: 0,
-                                    allowSoftHyphens: true,
+                                child: _KeptAlive(
+                                  child: RepaintBoundary(
+                                    child: SizedBox.expand(
+                                      child: SinglePageView(
+                                        page: page,
+                                        lineSpacing: 0,
+                                        allowSoftHyphens: true,
+                                      ),
+                                    ),
                                   ),
                                 ),
-                              ),
-                            );
-                          },
+                              );
+                            },
+                          ),
                         ),
                       );
                     });
@@ -235,7 +246,7 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
             ),
           ),
 
-          // Панель со слайдером: учитываем только нижний системный inset
+          // нижняя панель со слайдером
           SafeArea(
             top: false,
             bottom: true,
@@ -265,8 +276,7 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
 
                           WidgetsBinding.instance.addPostFrameCallback((_) {
                             if (!mounted) return;
-                            controller.ensurePage(context, newIndex + 1);
-                            controller.prefetchAround(context, newIndex, radius: 2);
+                            controller.ensureAhead(context, newIndex, ahead: 4);
                             _syncSliderWithPage(newIndex);
                           });
                         },
@@ -302,5 +312,25 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
       columnWidth: contentWidth,
       columnSpacing: 0,
     );
+  }
+}
+
+/// Простая обёртка, чтобы PageView не уничтожал виджет страницы сразу после ухода с экрана
+class _KeptAlive extends StatefulWidget {
+  final Widget child;
+  const _KeptAlive({required this.child});
+
+  @override
+  State<_KeptAlive> createState() => _KeptAliveState();
+}
+
+class _KeptAliveState extends State<_KeptAlive>
+    with AutomaticKeepAliveClientMixin {
+  @override
+  bool get wantKeepAlive => true;
+  @override
+  Widget build(BuildContext context) {
+    super.build(context);
+    return widget.child;
   }
 }
