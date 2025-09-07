@@ -1,11 +1,8 @@
 // lib/features/reader_screen/presentation/paged_reader_screen.dart
-import 'dart:ui' as ui show PointerDeviceKind;
-
 import 'package:beam_reader/di/injectable.dart';
 import 'package:beam_reader/engine/elements/layout_blocks/custom_text_layout.dart';
 import 'package:beam_reader/engine/elements/layout_blocks/multi_column_page.dart';
 import 'package:beam_reader/features/reader_screen/presentation/widgets/single_page_view.dart';
-import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:signals_flutter/signals_flutter.dart';
@@ -31,8 +28,6 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
 
   static const _kAnimDuration = Duration(milliseconds: 180);
   bool _isAnimating = false;
-  DateTime? _lastWheelTs;
-  static const _kWheelThrottle = Duration(milliseconds: 220);
 
   @override
   void initState() {
@@ -59,7 +54,7 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
 
     _isAnimating = true;
 
-    // мягко подготовим цель и соседей — уже после кадра (не блокируем UI)
+    // лениво подготавливаем цель
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       controller.ensurePage(context, target);
@@ -77,25 +72,6 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
     }
   }
 
-
-
-  void _handlePointerSignal(PointerSignalEvent signal) {
-    if (signal is! PointerScrollEvent) return;
-
-    // throttle, чтобы одно «прокручивание» не давало серию перелистываний
-    final now = DateTime.now();
-    if (_lastWheelTs != null &&
-        now.difference(_lastWheelTs!) < _kWheelThrottle) return;
-    _lastWheelTs = now;
-
-    // Колесо обычно вертикальное — маппим вниз -> следующая страница
-    final dy = signal.scrollDelta.dy;
-    if (dy > 0) {
-      _goTo(_currentIndex + 1);
-    } else if (dy < 0) {
-      _goTo(_currentIndex - 1);
-    }
-  }
   KeyEventResult _handleKey(KeyEvent e) {
     if (e is! KeyDownEvent) return KeyEventResult.ignored;
 
@@ -119,27 +95,34 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
 
     return KeyEventResult.ignored;
   }
+
   @override
   Widget build(BuildContext context) {
-    final scrollBehavior = _EverywhereDragScrollBehavior();
-
     return Scaffold(
       backgroundColor: Colors.white,
       body: SafeArea(
         child: OrientationBuilder(
           builder: (ctx, orientation) {
-
+            // обработка смены ориентации: пересчет и восстановление "назад"
             if (_lastOrientation != orientation) {
               _lastOrientation = orientation;
               final anchor = controller.anchorForPage(_currentIndex);
-              //вызывает баг
-              WidgetsBinding.instance.addPostFrameCallback((_) async {
-                await controller.reflow(context, preserve: anchor);
-                if (mounted ) {
 
-                  _pageCtrl.jumpToPage(0);
-                  _currentIndex = 0;
-                }
+              WidgetsBinding.instance.addPostFrameCallback((_) async {
+                final startIndex =
+                await controller.reflow(context, preserve: anchor, backfill: 3);
+                if (!mounted) return;
+
+                // ставим PageView на корректную страницу (учтен backfill)
+                _pageCtrl.jumpToPage(startIndex);
+                _currentIndex = startIndex;
+
+                // подгрузим окрестности
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  if (!mounted) return;
+                  controller.ensurePage(context, startIndex);
+                  controller.prefetchAround(context, startIndex, radius: 2);
+                });
               });
             }
 
@@ -153,60 +136,53 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
                     return const Center(child: CircularProgressIndicator());
                   }
 
-                  return ScrollConfiguration(
-                    behavior: scrollBehavior,
-                    child: Focus(
-                      autofocus: true,
-                      onKeyEvent: (node, event) =>
-                          _handleKey(event),
-                      child: Listener(
-                        onPointerSignal: _handlePointerSignal, // колесо мыши / трекпад
-                        child: PageView.builder(
-                          controller: _pageCtrl,
-                          physics: const PageScrollPhysics(),
-                          allowImplicitScrolling: true, // lookahead для iOS/desktop
-                          onPageChanged: (i) {
-                            _currentIndex = i;
-                            // откладываем тяжелую работу на следующий кадр
-                            WidgetsBinding.instance.addPostFrameCallback((_) {
-                              if (!mounted) return;
-                              controller.ensurePage(context, i);
-                              controller.prefetchAround(context, i, radius: 2);
-                            });
-                          },
-                          itemCount: total,
-                          itemBuilder: (ctx, index) {
-                            final layout = controller.getPage(index);
-                            if (layout == null) {
-                              return Padding(
-                                padding: _contentPad,
-                                child: const RepaintBoundary(
-                                  child: ColoredBox(color: Colors.white),
-                                ),
-                              );
-                            }
+                  // только свайпы (PageView) и клавиатура — никаких mouse/trackpad listeners
+                  return Focus(
+                    autofocus: true,
+                    onKeyEvent: (node, event) => _handleKey(event),
+                    child: PageView.builder(
+                      controller: _pageCtrl,
+                      physics: const PageScrollPhysics(), // свайпы
+                      allowImplicitScrolling: true,
+                      onPageChanged: (i) {
+                        _currentIndex = i;
+                        WidgetsBinding.instance.addPostFrameCallback((_) {
+                          if (!mounted) return;
+                          controller.ensurePage(context, i);
+                          controller.prefetchAround(context, i, radius: 2);
+                        });
+                      },
+                      itemCount: total,
+                      itemBuilder: (ctx, index) {
+                        final layout = controller.getPage(index);
+                        if (layout == null) {
+                          return Padding(
+                            padding: _contentPad,
+                            child: const RepaintBoundary(
+                              child: ColoredBox(color: Colors.white),
+                            ),
+                          );
+                        }
 
-                            final page = _buildPageFromLayout(
-                              safeSize,
-                              layout,
-                              _contentPad,
-                            );
+                        final page = _buildPageFromLayout(
+                          safeSize,
+                          layout,
+                          _contentPad,
+                        );
 
-                            return Padding(
-                              padding: _contentPad,
-                              child: RepaintBoundary(
-                                child: SizedBox.expand(
-                                  child: SinglePageView(
-                                    page: page,
-                                    lineSpacing: 0,
-                                    allowSoftHyphens: true,
-                                  ),
-                                ),
+                        return Padding(
+                          padding: _contentPad,
+                          child: RepaintBoundary(
+                            child: SizedBox.expand(
+                              child: SinglePageView(
+                                page: page,
+                                lineSpacing: 0,
+                                allowSoftHyphens: true,
                               ),
-                            );
-                          },
-                        ),
-                      ),
+                            ),
+                          ),
+                        );
+                      },
                     ),
                   );
                 });
@@ -234,15 +210,4 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
       columnSpacing: 0,
     );
   }
-}
-
-class _EverywhereDragScrollBehavior extends MaterialScrollBehavior {
-  @override
-  Set<ui.PointerDeviceKind> get dragDevices => <ui.PointerDeviceKind>{
-    ui.PointerDeviceKind.touch,
-    ui.PointerDeviceKind.mouse,
-    ui.PointerDeviceKind.trackpad,
-    ui.PointerDeviceKind.stylus,
-    ui.PointerDeviceKind.unknown,
-  };
 }

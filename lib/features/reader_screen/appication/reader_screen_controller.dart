@@ -20,7 +20,7 @@ import 'package:beam_reader/engine/elements/text_utils.dart';
 import 'package:beam_reader/engine/elements/data_blocks/block_text.dart';
 import 'package:beam_reader/engine/fb2_transform.dart';
 
-/// Нужен, чтобы UI мог сохранить/восстановить позицию (совместимость).
+/// Совместимость с UI: якорь «позиции в тексте»
 class ReaderAnchor {
   final int blockIndex;
   final int charOffset;
@@ -32,30 +32,23 @@ class ReaderPagerController {
   final XmlLoader xmlLoader;
   ReaderPagerController(this.xmlLoader);
 
-  /* ===== Публичные сигналы/состояние ===== */
-
-  /// Кол-во уже построенных страниц (ленивая пагинация).
+  /* ===== Сигналы ===== */
   final totalPages = signal<int>(0);
 
-  /* ===== Внутренние данные книги ===== */
-
+  /* ===== Книга ===== */
   List<BlockText> _blocks = [];
   late Map<String, Uint8List> _binaries;
   final Map<String, ui.Image> _imgCache = {};
 
-  /* ===== Кэш страниц (линейная модель) ===== */
-
+  /* ===== Кэш страниц ===== */
   final List<CustomTextLayout> _pages = [];
   final List<_Cursor> _pageStarts = []; // откуда начиналась страница i
-  final List<_Cursor> _pageEnds = [];   // где закончилась страница i
-
-  /// Точка, с которой строится СЛЕДУЮЩАЯ страница.
-  _Cursor _cursor = const _Cursor(blockIndex: 0, charOffset: 0);
+  final List<_Cursor> _pageEnds   = []; // где закончилась страница i
+  _Cursor _cursor = const _Cursor(blockIndex: 0, charOffset: 0); // старт для следующей вперёд
 
   bool inited = false;
 
-  /* ===== Вёрсточные константы ===== */
-
+  /* ===== Параметры верстки ===== */
   static const _baseFontSize = 16.0;
   static const _lineHeight = 1.6;
   static const _pagePadding = EdgeInsets.symmetric(horizontal: 20, vertical: 28);
@@ -68,7 +61,7 @@ class ReaderPagerController {
 
     final xml = XmlDocument.parse(await xmlLoader.loadBook());
     final transformer = Fb2Transformer();
-    _blocks = transformer.parseToBlocks(xml.rootElement);
+    _blocks   = transformer.parseToBlocks(xml.rootElement);
     _binaries = extractBinaryMap(xml);
 
     _resetPagination(const ReaderAnchor(0, 0));
@@ -76,37 +69,56 @@ class ReaderPagerController {
     await ensurePage(context, 1);
   }
 
-  /// Возвращает якорь-старт указанной страницы (для совместимости с UI).
+  /// Возврат стартового курсора страницы (совместимость).
   ReaderAnchor anchorForPage(int index) {
     if (index < 0 || index >= _pageStarts.length) return const ReaderAnchor(0, 0);
     final c = _pageStarts[index];
     return ReaderAnchor(c.blockIndex, c.charOffset);
   }
 
-  /// Полный пересчёт с опциональным сохранением позиции.
-  Future<void> reflow(BuildContext context, {ReaderAnchor? preserve}) async {
-    _resetPagination(preserve ?? const ReaderAnchor(0, 0));
+  /// Полный пересчёт. Построит страницы вперёд от preserve и **backfill** страниц назад.
+  /// Возвращает индекс страницы, на которую стоит перейти после пересчёта.
+  Future<int> reflow(BuildContext context, {ReaderAnchor? preserve, int backfill = 3}) async {
+    final keep = preserve ?? const ReaderAnchor(0, 0);
+    _resetPagination(keep);
+
+    // Сначала строим «текущую» и следующую вперёд — чтобы показать экран
     await ensurePage(context, 0);
     await ensurePage(context, 1);
+
+    // Затем достроим несколько страниц НАЗАД, чтобы пользователь мог листать влево
+    int builtBack = 0;
+    for (; builtBack < backfill; builtBack++) {
+      final prev = await _buildPrevPage(context, _pageStarts.isEmpty ? _cursor : _pageStarts.first);
+      if (prev == null) break;
+      // prepend
+      _pages.insert(0, prev.layout);
+      _pageStarts.insert(0, prev.start);
+      _pageEnds.insert(0, prev.end);
+    }
+    if (builtBack > 0) {
+      totalPages.value = _pages.length;
+    }
+
+    // вернуть индекс «текущей» страницы с учетом префикса
+    return builtBack;
   }
 
   CustomTextLayout? getPage(int index) =>
       (index >= 0 && index < _pages.length) ? _pages[index] : null;
 
-  /// Гарантирует, что страница `pageIndex` построена (лениво).
+  /// Лениво гарантирует наличие страницы.
   Future<void> ensurePage(BuildContext context, int pageIndex) async {
     if (pageIndex < 0) return;
-    // Уже есть — ничего не делаем.
     if (pageIndex < _pages.length) return;
 
-    // Строим последовательно до требуемого индекса.
     while (_pages.length <= pageIndex) {
       final built = await _buildNextPage(context, _cursor);
-      if (built == null) break; // достигнут конец книги
+      if (built == null) break;
       _pageStarts.add(_cursor);
       _pages.add(built.layout);
       _pageEnds.add(built.end);
-      _cursor = built.end; // следующий старт — конец только что построенной
+      _cursor = built.end;
       totalPages.value = _pages.length;
     }
   }
@@ -119,7 +131,7 @@ class ReaderPagerController {
     }
   }
 
-  /* ====================== Низкий уровень ====================== */
+  /* ====================== Внутренности ====================== */
 
   void _resetPagination(ReaderAnchor anchor) {
     _pages.clear();
@@ -141,6 +153,16 @@ class ReaderPagerController {
     if (b.tag == 'image' || b.tag == 'empty-line') return true;
     return inlineTextTotalLength(b.inlines) == 0;
   }
+
+  bool _isAfter(_Cursor a, _Cursor b) =>
+      (a.blockIndex > b.blockIndex) ||
+          (a.blockIndex == b.blockIndex && a.charOffset > b.charOffset);
+
+  bool _isAfterOrEq(_Cursor a, _Cursor b) =>
+      a.blockIndex > b.blockIndex ||
+          (a.blockIndex == b.blockIndex && a.charOffset >= b.charOffset);
+
+  /* ---------- ресурсы изображений ---------- */
 
   Future<ui.Image?> _resolveImageForAttrs(Map<String, String>? attrs) async {
     if (attrs == null) return null;
@@ -281,7 +303,7 @@ class ReaderPagerController {
     return sb.toString();
   }
 
-  /* ===================== Генерация страницы ===================== */
+  /* ===================== Построение страниц вперёд ===================== */
 
   Future<_BuiltPage?> _buildNextPage(BuildContext context, _Cursor start) async {
     if (start.blockIndex >= _blocks.length) return null;
@@ -310,7 +332,6 @@ class ReaderPagerController {
     const kMaxStagnant = 2;
 
     while (bi < _blocks.length) {
-      // Граница секции: переносим остаток на новую страницу
       if (paragraphs.isNotEmpty && _sectionOfBlock(bi) != pageSection) {
         forcedSectionBreak = true;
         break;
@@ -344,7 +365,6 @@ class ReaderPagerController {
         usedH += h;
       }
 
-      // Страховка от «застреваний»
       if (visible.length == prevCount) {
         stagnant++;
         if (stagnant >= kMaxStagnant) break;
@@ -363,16 +383,14 @@ class ReaderPagerController {
 
     if (layout == null) return null;
 
-    // --- вычисляем, с какого места продолжать следующую страницу ---
+    // --- конец страницы (куда продолжать дальше) ---
     late _Cursor endCursor;
 
     if (visible.isEmpty) {
-      // Пустая (например, слишком высокая картинка) → продвигаемся на следующий осмысленный блок
       int nb = metas.isNotEmpty ? metas.last.blockIndex + 1 : start.blockIndex + 1;
       while (nb < _blocks.length && _isZeroLengthBlock(nb)) nb++;
       endCursor = _Cursor(blockIndex: nb.clamp(0, _blocks.length), charOffset: 0);
     } else if (forcedSectionBreak) {
-      // Следующая секция начинается с bi
       endCursor = _Cursor(blockIndex: bi, charOffset: 0);
     } else {
       final pidx = layout.paragraphIndexOfLine;
@@ -410,14 +428,13 @@ class ReaderPagerController {
         final endsWithHyphen = _lineEndsWithDrawnHyphen(visible[lastLine]);
         if (endsWithHyphen && charsVisible > 0) charsVisible -= 1;
 
-        // проверим разрыв внутри слова — если да и есть место, откатимся на предыдущую строку
         final paraText = _concatParagraphText(paragraphs[lastPara]);
         bool breaksInsideWord = false;
         if (charsVisible > 0 && charsVisible < paraText.length) {
           final prevCU = paraText.codeUnitAt(charsVisible - 1);
           final nextCU = paraText.codeUnitAt(charsVisible);
-          breaksInsideWord = RegExp(r'[A-Za-zА-Яа-яЁё0-9]').hasMatch(String.fromCharCode(prevCU)) &&
-              RegExp(r'[A-Za-zА-Яа-яЁё0-9]').hasMatch(String.fromCharCode(nextCU));
+          bool isWord(int cu) => RegExp(r'[A-Za-zА-Яа-яЁё0-9]').hasMatch(String.fromCharCode(cu));
+          breaksInsideWord = isWord(prevCU) && isWord(nextCU);
         }
 
         if ((breaksInsideWord || endsWithHyphen) && visible.length > 1) {
@@ -460,6 +477,72 @@ class ReaderPagerController {
 
     return _BuiltPage(pageLayout, endCursor);
   }
+
+  /* ===================== Построение предыдущей страницы ===================== */
+  /// Строит страницу, которая заканчивается ровно в `currentStart` (или как можно ближе перед ним).
+  /// Возвращает layout и пару курсоров: start..end (end ~= currentStart).
+  Future<_BuiltPrevPage?> _buildPrevPage(BuildContext context, _Cursor currentStart) async {
+    if (currentStart.blockIndex <= 0 && currentStart.charOffset <= 0) return null;
+
+    // Поищем старт не дальше, чем на 40 блоков назад — дешево и сердито.
+    const int kMaxLookbackBlocks = 40;
+    final int minStart = (currentStart.blockIndex - kMaxLookbackBlocks).clamp(0, _blocks.length);
+
+    _BuiltPage? lastBefore; // последний, чей end <= currentStart
+    for (int si = minStart; si <= currentStart.blockIndex; si++) {
+      final built = await _buildNextPage(context, _Cursor(blockIndex: si, charOffset: 0));
+      if (built == null) break;
+
+      if (_isAfter(built.end, currentStart)) {
+        // Переступили границу — предыдущий был лучшим кандидатом
+        if (lastBefore == null) {
+          // крайний случай: даже с minStart страница вышла дальше currentStart.
+          // Тогда вернём её — пользователь всё равно увидит максимально возможный объем.
+          return _BuiltPrevPage(
+            layout: built.layout,
+            start: _Cursor(blockIndex: si, charOffset: 0),
+            end: built.end,
+          );
+        } else {
+          final startIdx = (si - 1).clamp(0, _blocks.length);
+          return _BuiltPrevPage(
+            layout: lastBefore.layout,
+            start: _Cursor(blockIndex: startIdx, charOffset: 0),
+            end: lastBefore.end,
+          );
+        }
+      } else if (_isAfterOrEq(built.end, currentStart)) {
+        // Закончились ровно на нужной позиции
+        return _BuiltPrevPage(
+          layout: built.layout,
+          start: _Cursor(blockIndex: si, charOffset: 0),
+          end: built.end,
+        );
+      }
+
+      lastBefore = built; // пока страница заканчивается раньше — запомним
+    }
+
+    // Если цикл закончился и мы так и не переступили — берём последний вариант «до»
+    if (lastBefore != null) {
+      final bestStart = (currentStart.blockIndex).clamp(0, _blocks.length);
+      // start у lastBefore соответствует тому si, на котором он строился — мы не сохранили его.
+      // Для простоты пересчитаем ещё раз.
+      for (int si = currentStart.blockIndex; si >= minStart; si--) {
+        final probe = await _buildNextPage(context, _Cursor(blockIndex: si, charOffset: 0));
+        if (probe == null) break;
+        if (!_isAfter(probe.end, currentStart)) {
+          return _BuiltPrevPage(
+            layout: probe.layout,
+            start: _Cursor(blockIndex: si, charOffset: 0),
+            end: probe.end,
+          );
+        }
+      }
+    }
+
+    return null;
+  }
 }
 
 /* ======================= Вспомогательные типы ======================= */
@@ -474,6 +557,17 @@ class _BuiltPage {
   final CustomTextLayout layout;
   final _Cursor end;
   _BuiltPage(this.layout, this.end);
+}
+
+class _BuiltPrevPage {
+  final CustomTextLayout layout;
+  final _Cursor start;
+  final _Cursor end;
+  _BuiltPrevPage({
+    required this.layout,
+    required this.start,
+    required this.end,
+  });
 }
 
 class _ParaMeta {
