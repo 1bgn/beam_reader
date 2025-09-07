@@ -1,4 +1,3 @@
-// lib/features/reader_screen/presentation/paged_reader_screen.dart
 import 'package:beam_reader/di/injectable.dart';
 import 'package:beam_reader/engine/elements/layout_blocks/custom_text_layout.dart';
 import 'package:beam_reader/engine/elements/layout_blocks/multi_column_page.dart';
@@ -28,6 +27,10 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
 
   static const _kAnimDuration = Duration(milliseconds: 180);
   bool _isAnimating = false;
+
+  // — Слайдер прогресса —
+  double _progress = 0.0;
+  bool _isSeeking = false;
 
   @override
   void initState() {
@@ -88,11 +91,34 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
     if (e.logicalKey == LogicalKeyboardKey.arrowLeft ||
         e.logicalKey == LogicalKeyboardKey.pageUp ||
         (e.logicalKey == LogicalKeyboardKey.space && isShift)) {
-      _goTo(_currentIndex - 1);
+      // если подошли к началу — лениво подгружаем прошлые
+      _maybeExpandBefore().then((_) {
+        _goTo(_currentIndex - 1);
+      });
       return KeyEventResult.handled;
     }
 
     return KeyEventResult.ignored;
+  }
+
+  Future<void> _maybeExpandBefore() async {
+    // если уже есть запас слева — ничего не делаем
+    if (_currentIndex > 0) return;
+
+    // запросим у контроллера подгрузить, например, 3 страницы
+    final added = await controller.lazyEnsurePrev(context, want: 3);
+    if (added > 0 && mounted && _pageCtrl.hasClients) {
+      // визуально остаёмся на той же странице — нужно сдвинуть контроллер
+      final newIndex = _currentIndex + added;
+      _pageCtrl.jumpToPage(newIndex);
+      _currentIndex = newIndex;
+      setState(() {});
+    }
+  }
+
+  void _syncSliderWithPage(int pageIndex) {
+    final p = controller.pageStartProgress(pageIndex);
+    setState(() => _progress = p);
   }
 
   @override
@@ -104,19 +130,26 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
           builder: (ctx, orientation) {
             if (_lastOrientation != orientation) {
               _lastOrientation = orientation;
-              final anchor = controller.anchorForPage(_currentIndex);
 
-              // ВАЖНО: рефлоу возвращает правильный индекс текущей страницы
+              // устойчивый якорь — начало абзаца
+              final idAnchor = controller.idAnchorForPage(_currentIndex);
+
               WidgetsBinding.instance.addPostFrameCallback((_) async {
-                final newIndex = await controller.reflow(context, preserve: anchor);
+                final newIndex = await controller.reflowFromId(
+                  context,
+                  keep: idAnchor,
+                );
                 if (!mounted) return;
+
                 _pageCtrl.jumpToPage(newIndex);
                 _currentIndex = newIndex;
 
+                // сразу гарантируем запас вперёд
                 WidgetsBinding.instance.addPostFrameCallback((_) {
                   if (!mounted) return;
                   controller.ensurePage(context, newIndex + 1);
                   controller.prefetchAround(context, newIndex, radius: 2);
+                  _syncSliderWithPage(newIndex);
                 });
               });
             }
@@ -131,54 +164,109 @@ class _PagedReaderScreenState extends State<PagedReaderScreen> {
                     return const Center(child: CircularProgressIndicator());
                   }
 
-                  // Только свайпы и клавиатура
-                  return Focus(
-                    autofocus: true,
-                    onKeyEvent: (node, event) => _handleKey(event),
-                    child: PageView.builder(
-                      controller: _pageCtrl,
-                      physics: const PageScrollPhysics(),
-                      allowImplicitScrolling: true,
-                      onPageChanged: (i) {
-                        _currentIndex = i;
-                        WidgetsBinding.instance.addPostFrameCallback((_) {
-                          if (!mounted) return;
-                          controller.ensurePage(context, i + 1);
-                          controller.prefetchAround(context, i, radius: 2);
-                        });
-                      },
-                      itemCount: total,
-                      itemBuilder: (ctx, index) {
-                        final layout = controller.getPage(index);
-                        if (layout == null) {
-                          return Padding(
-                            padding: _contentPad,
-                            child: const RepaintBoundary(
-                              child: ColoredBox(color: Colors.white),
-                            ),
-                          );
-                        }
+                  return Stack(
+                    children: [
+                      // основной контент
+                      Focus(
+                        autofocus: true,
+                        onKeyEvent: (node, event) => _handleKey(event),
+                        child: PageView.builder(
+                          controller: _pageCtrl,
+                          physics: const PageScrollPhysics(),
+                          allowImplicitScrolling: true,
+                          onPageChanged: (i) async {
+                            // если подошли к началу — подгрузим прошлые лениво
+                            if (i <= 1) {
+                              final added = await controller.lazyEnsurePrev(context, want: 3);
+                              if (added > 0 && mounted && _pageCtrl.hasClients) {
+                                // сдвигаем, чтобы остаться на той же визуальной странице
+                                _pageCtrl.jumpToPage(i + added);
+                                _currentIndex = i + added;
+                                _syncSliderWithPage(_currentIndex);
+                                return;
+                              }
+                            }
 
-                        final page = _buildPageFromLayout(
-                          safeSize,
-                          layout,
-                          _contentPad,
-                        );
+                            _currentIndex = i;
+                            controller.ensurePage(context, i + 1);
+                            controller.prefetchAround(context, i, radius: 2);
+                            _syncSliderWithPage(i);
+                          },
+                          itemCount: total,
+                          itemBuilder: (ctx, index) {
+                            final layout = controller.getPage(index);
+                            if (layout == null) {
+                              return Padding(
+                                padding: _contentPad,
+                                child: const RepaintBoundary(
+                                  child: ColoredBox(color: Colors.white),
+                                ),
+                              );
+                            }
 
-                        return Padding(
-                          padding: _contentPad,
-                          child: RepaintBoundary(
-                            child: SizedBox.expand(
-                              child: SinglePageView(
-                                page: page,
-                                lineSpacing: 0,
-                                allowSoftHyphens: true,
+                            final page = _buildPageFromLayout(
+                              safeSize,
+                              layout,
+                              _contentPad,
+                            );
+
+                            return Padding(
+                              padding: _contentPad,
+                              child: RepaintBoundary(
+                                child: SizedBox.expand(
+                                  child: SinglePageView(
+                                    page: page,
+                                    lineSpacing: 0,
+                                    allowSoftHyphens: true,
+                                  ),
+                                ),
                               ),
-                            ),
+                            );
+                          },
+                        ),
+                      ),
+
+                      // прогресс-слайдер (не перекрывает текст: поверх, но с паддингом)
+                      Positioned(
+                        left: 16,
+                        right: 16,
+                        bottom: 8,
+                        child: IgnorePointer(
+                          ignoring: false,
+                          child: Row(
+                            children: [
+                              Expanded(
+                                child: Slider(
+                                  value: _isSeeking ? _progress : controller.pageStartProgress(_currentIndex),
+                                  onChangeStart: (_) => setState(() => _isSeeking = true),
+                                  onChanged: (v) => setState(() => _progress = v),
+                                  onChangeEnd: (v) async {
+                                    setState(() => _isSeeking = false);
+                                    final newIndex = await controller.jumpToPercent(context, v);
+                                    if (!mounted) return;
+                                    _pageCtrl.jumpToPage(newIndex);
+                                    _currentIndex = newIndex;
+
+                                    // после прыжка — подгружаем вперёд и синхронизируем прогресс
+                                    WidgetsBinding.instance.addPostFrameCallback((_) {
+                                      if (!mounted) return;
+                                      controller.ensurePage(context, newIndex + 1);
+                                      controller.prefetchAround(context, newIndex, radius: 2);
+                                      _syncSliderWithPage(newIndex);
+                                    });
+                                  },
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Text(
+                                '${(controller.pageStartProgress(_currentIndex) * 100).toStringAsFixed(0)}%',
+                                style: const TextStyle(fontSize: 12),
+                              ),
+                            ],
                           ),
-                        );
-                      },
-                    ),
+                        ),
+                      ),
+                    ],
                   );
                 });
               },

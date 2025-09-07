@@ -1,4 +1,3 @@
-// lib/features/reader_screen/appication/reader_screen_controller.dart
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
@@ -26,28 +25,59 @@ class ReaderAnchor {
   const ReaderAnchor(this.blockIndex, this.charOffset);
 }
 
+/// Устойчивый якорь: начало абзаца (id) + offset (мы используем offset=0)
+class ReaderIdAnchor {
+  final String blockId;
+  final int charOffset;
+  const ReaderIdAnchor(this.blockId, this.charOffset);
+}
+
 @LazySingleton()
 class ReaderPagerController {
   final XmlLoader xmlLoader;
   ReaderPagerController(this.xmlLoader);
 
+  /* ===== Public state ===== */
   final totalPages = signal<int>(0);
 
+  /* ===== Book ===== */
   List<BlockText> _blocks = [];
   late Map<String, Uint8List> _binaries;
   final Map<String, ui.Image> _imgCache = {};
 
+  /* ===== Pages cache (deque) ===== */
   final List<CustomTextLayout> _pages = [];
-  final List<_Cursor> _pageStarts = [];
-  final List<_Cursor> _pageEnds   = [];
-  _Cursor _cursor = const _Cursor(blockIndex: 0, charOffset: 0);
+  final List<_Cursor> _pageStarts = []; // включительно
+  final List<_Cursor> _pageEnds   = []; // эксклюзивно (куда продолжать дальше)
+  _Cursor _cursor = const _Cursor(blockIndex: 0, charOffset: 0); // where to build next forward
 
   bool inited = false;
 
+  /* ===== Layout params ===== */
   static const _baseFontSize = 16.0;
   static const _lineHeight = 1.6;
   static const _pagePadding = EdgeInsets.symmetric(horizontal: 20, vertical: 28);
 
+  /* ===== Indices & helpers ===== */
+  // char prefix for slider (быстрый прыжок по процентам)
+  late List<int> _charPrefix; // len = _blocks.length + 1
+  int _totalChars = 0;
+  int get totalChars => _totalChars;
+
+  late Map<String, int> _idToBlockIndex;
+
+  /* ========================= API ========================= */
+  double pageStartProgress(int pageIndex) {
+    if (_totalChars <= 0) return 0.0;
+    if (pageIndex < 0 || pageIndex >= _pageStarts.length) return 0.0;
+
+    final _Cursor start = _pageStarts[pageIndex];
+    final int g = _globalCharOfCursor(start); // глобальная позиция начала страницы
+    if (g <= 0) return 0.0;
+    if (g >= _totalChars) return 1.0;
+
+    return g / _totalChars;
+  }
   Future<void> init(BuildContext context) async {
     if (inited) return;
     inited = true;
@@ -57,69 +87,58 @@ class ReaderPagerController {
     _blocks   = transformer.parseToBlocks(xml.rootElement);
     _binaries = extractBinaryMap(xml);
 
+    _buildIndices();
+
     _resetPagination(const ReaderAnchor(0, 0));
     await ensurePage(context, 0);
     await ensurePage(context, 1);
   }
 
+  /// Якорь текущей страницы (для совместимости)
   ReaderAnchor anchorForPage(int index) {
     if (index < 0 || index >= _pageStarts.length) return const ReaderAnchor(0, 0);
     final c = _pageStarts[index];
     return ReaderAnchor(c.blockIndex, c.charOffset);
   }
 
-  Future<int> reflow(BuildContext context, {ReaderAnchor? preserve, int backfill = 0}) async {
-    // 1) если якорь не передан — считаем, что это начало
-    final keep = preserve ?? const ReaderAnchor(0, 0);
-
-    // 2) ПОЛНЫЙ пересчёт ВПЕРЁД ОТ НАЧАЛА, чтобы восстановить все предыдущие страницы
-    _resetPagination(const ReaderAnchor(0, 0));
-
-    final wanted = _Cursor(blockIndex: keep.blockIndex, charOffset: keep.charOffset);
-    int targetIndex = 0;
-
-    while (true) {
-      // если уже есть страницы и последняя "накрыла" якорь — останавливаемся
-      if (_pages.isNotEmpty) {
-        final st = _pageStarts.last;
-        final ed = _pageEnds.last; // end — курсор продолжения НЕ РАНЬШЕ конца страницы
-        final stLeWanted = !_isAfter(st, wanted);       // st <= wanted
-        final wantedLeEd = !_isAfter(wanted, ed);       // wanted <= ed
-        if (stLeWanted && wantedLeEd) {
-          targetIndex = _pages.length - 1;
-          break;
-        }
-        // если уже прошли якорь (редкий случай) — ставим на предыдущую
-        if (_isAfter(st, wanted)) {
-          targetIndex = (_pages.length - 2).clamp(0, _pages.length - 1);
-          break;
-        }
-      }
-
-      final before = _cursor;
-      final built = await _buildNextPage(context, _cursor);
-      if (built == null) break; // дошли до конца книги
-
-      // инварианты против дублей
-      if (!_isAfter(built.end, before)) break;
-      if (_pageEnds.isNotEmpty && !_isAfter(built.end, _pageEnds.last)) break;
-
-      _pageStarts.add(before);
-      _pages.add(built.layout);
-      _pageEnds.add(built.end);
-      _cursor = built.end;
-      totalPages.value = _pages.length;
+  /// Устойчивый ID-якорь (начало абзаца)
+  ReaderIdAnchor idAnchorForPage(int index) {
+    if (index < 0 || index >= _pageStarts.length) {
+      final firstId = _blocks.isNotEmpty ? _blocks.first.id : '';
+      return ReaderIdAnchor(firstId, 0);
     }
+    final c = _pageStarts[index];
+    final bi = c.blockIndex.clamp(0, _blocks.length - 1);
+    return ReaderIdAnchor(_blocks[bi].id, 0);
+  }
 
-    // на всякий: подстроим ещё одну страницу вперёд для плавности
-    await ensurePage(context, targetIndex + 1);
+  /// Полный пересчёт вокруг preserve (после поворота). Возвращает индекс текущей страницы.
+  Future<int> reflow(BuildContext context, {ReaderAnchor? preserve}) async {
+    final keep = preserve ?? const ReaderAnchor(0, 0);
+    // ВАЖНО: якоримся на начало абзаца
+    final bi = keep.blockIndex.clamp(0, _blocks.length);
+    _resetPagination(ReaderAnchor(bi, 0));
 
-    return targetIndex;
+    await ensurePage(context, 0);
+    await ensurePage(context, 1);
+
+    // ленивое восстановление прошлых будет по требованию (см. lazyEnsurePrev)
+    return 0;
+  }
+
+  /// Быстрый рефлоу по ID-абзацу. Возвращает индекс текущей.
+  Future<int> reflowFromId(BuildContext context, {required ReaderIdAnchor keep}) async {
+    final bi = _idToBlockIndex[keep.blockId] ?? 0;
+    _resetPagination(ReaderAnchor(bi.clamp(0, _blocks.length), 0));
+    await ensurePage(context, 0);
+    await ensurePage(context, 1);
+    return 0;
   }
 
   CustomTextLayout? getPage(int index) =>
       (index >= 0 && index < _pages.length) ? _pages[index] : null;
 
+  /// Гарантировать наличие страницы index (вперёд)
   Future<void> ensurePage(BuildContext context, int pageIndex) async {
     if (pageIndex < 0) return;
     if (pageIndex < _pages.length) return;
@@ -129,10 +148,8 @@ class ReaderPagerController {
       final built = await _buildNextPage(context, _cursor);
       if (built == null) break;
 
-      // FIX: если страница не продвинула курсор — прекращаем (иначе дубликаты)
+      // защита от дублей/застреваний
       if (!_isAfter(built.end, before)) break;
-
-      // FIX: если есть предыдущая страница и её конец не меньше нового конца — тоже не добавляем
       if (_pageEnds.isNotEmpty && !_isAfter(built.end, _pageEnds.last)) break;
 
       _pageStarts.add(before);
@@ -141,6 +158,64 @@ class ReaderPagerController {
       _cursor = built.end;
       totalPages.value = _pages.length;
     }
+  }
+
+  /// Ленивая подгрузка прошлых страниц «по требованию».
+  /// Возвращает, сколько страниц реально добавили слева.
+  Future<int> lazyEnsurePrev(BuildContext context, {int want = 1}) async {
+    if (_pageStarts.isEmpty) return 0;
+
+    int added = 0;
+    while (added < want) {
+      final currStart = _pageStarts.first;
+
+      // уже в самом начале книги?
+      if (currStart.blockIndex <= 0 && currStart.charOffset <= 0) break;
+
+      // ищем старт предыдущей страницы по абзацам:
+      final prev = await _buildPrevPageStrictByBlocks(context, currStart.blockIndex);
+      if (prev == null) break;
+
+      // корректность: prev.end <= currStart
+      if (_isAfter(prev.end, currStart)) {
+        // если вдруг «перешагнули» — попробуем еще на 1 абзац дальше
+        final fallback = await _buildPrevPageStrictByBlocks(context, (currStart.blockIndex - 1).clamp(0, _blocks.length));
+        if (fallback == null || _isAfter(fallback.end, currStart)) break;
+        _pages.insert(0, fallback.layout);
+        _pageStarts.insert(0, fallback.start);
+        _pageEnds.insert(0, fallback.end);
+      } else {
+        _pages.insert(0, prev.layout);
+        _pageStarts.insert(0, prev.start);
+        _pageEnds.insert(0, prev.end);
+      }
+
+      totalPages.value = _pages.length;
+      added++;
+    }
+    return added;
+  }
+
+  /// Быстрый прыжок по проценту: прыгаем к началу абзаца и строим текущую/следующую.
+  /// Возвращаем индекс текущей (0 — т.к. прошлые лениво подгружаем по требованию).
+  Future<int> jumpToPercent(BuildContext context, double percent) async {
+    if (_blocks.isEmpty) return 0;
+    if (_totalChars <= 0) {
+      _resetPagination(const ReaderAnchor(0, 0));
+      await ensurePage(context, 0);
+      return 0;
+    }
+
+    final p = percent.clamp(0.0, 1.0);
+    final targetGlobal = (p * _totalChars).round();
+
+    final curSym = _cursorFromGlobalChar(targetGlobal);
+    final bi = curSym.blockIndex.clamp(0, _blocks.length);
+    _resetPagination(ReaderAnchor(bi, 0)); // начало абзаца
+
+    await ensurePage(context, 0);
+    await ensurePage(context, 1);
+    return 0;
   }
 
   Future<void> prefetchAround(BuildContext ctx, int index, {int radius = 2}) async {
@@ -151,13 +226,31 @@ class ReaderPagerController {
     }
   }
 
-  /* ====================== helpers & invariants ====================== */
+  /* ====================== internals ====================== */
+
+  void _buildIndices() {
+    _charPrefix = List<int>.filled(_blocks.length + 1, 0, growable: false);
+    _idToBlockIndex = <String, int>{};
+
+    int acc = 0;
+    for (int i = 0; i < _blocks.length; i++) {
+      final b = _blocks[i];
+      _idToBlockIndex[b.id] = i;
+
+      final len = (b.tag == 'image' || b.tag == 'empty-line')
+          ? 0
+          : inlineTextTotalLength(b.inlines);
+      acc += len;
+      _charPrefix[i + 1] = acc;
+    }
+    _totalChars = acc;
+  }
 
   void _resetPagination(ReaderAnchor anchor) {
     _pages.clear();
     _pageStarts.clear();
     _pageEnds.clear();
-    _cursor = _Cursor(blockIndex: anchor.blockIndex, charOffset: anchor.charOffset);
+    _cursor = _Cursor(blockIndex: anchor.blockIndex, charOffset: 0); // ВАЖНО: начало абзаца
     totalPages.value = 0;
   }
 
@@ -181,168 +274,98 @@ class ReaderPagerController {
       (a.blockIndex > b.blockIndex) ||
           (a.blockIndex == b.blockIndex && a.charOffset > b.charOffset);
 
-  // FIX: гарантированное продвижение минимум на 1 символ/блок
-  _Cursor _forceAdvanceAfter(_Cursor candidate, _Cursor current) {
-    if (_isAfter(candidate, current)) return candidate;
+  /* ---------- global char helpers (для процентной перемотки) ---------- */
 
-    // попробуем сдвинуться на 1 символ в текущем блоке
-    if (current.blockIndex < _blocks.length) {
-      final len = inlineTextTotalLength(_blocks[current.blockIndex].inlines);
-      if (current.charOffset < len) {
-        return _Cursor(blockIndex: current.blockIndex, charOffset: current.charOffset + 1);
+  int _globalCharOfCursor(_Cursor c) {
+    if (_totalChars == 0) return 0;
+    if (c.blockIndex <= 0) return 0;
+    if (c.blockIndex >= _blocks.length) return _totalChars;
+    final base = _charPrefix[c.blockIndex];
+    final len = inlineTextTotalLength(_blocks[c.blockIndex].inlines);
+    final off = (c.charOffset.clamp(0, len)) as int;
+    return (base + off).clamp(0, _totalChars) as int;
+  }
+
+  _Cursor _cursorFromGlobalChar(int g) {
+    if (_totalChars == 0) return const _Cursor(blockIndex: 0, charOffset: 0);
+    int target = g.clamp(0, _totalChars) as int;
+    int lo = 0, hi = _blocks.length;
+    while (lo < hi) {
+      final mid = (lo + hi) >> 1;
+      if (_charPrefix[mid] <= target) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
       }
     }
-    // иначе — в начало следующего блока
-    if (current.blockIndex + 1 < _blocks.length) {
-      return _Cursor(blockIndex: current.blockIndex + 1, charOffset: 0);
-    }
-    // уже конец книги — возвращаем current, upstream отфильтрует бездействие
-    return current;
+    final bi = (lo - 1).clamp(0, _blocks.length);
+    final base = _charPrefix[bi];
+    final inBlock = target - base;
+    final len =
+    (bi < _blocks.length) ? inlineTextTotalLength(_blocks[bi].inlines) : 0;
+    final off = inBlock.clamp(0, len) as int;
+    return _Cursor(blockIndex: bi, charOffset: off);
   }
 
-  /* ---------- images ---------- */
+  /* ---------- build previous page strictly by blocks ---------- */
 
-  Future<ui.Image?> _resolveImageForAttrs(Map<String, String>? attrs) async {
-    if (attrs == null) return null;
-    final href = attrs['href'] ?? attrs['xlink:href'];
-    if (href == null || href.isEmpty) return null;
-    final id = href.startsWith('#') ? href.substring(1) : href;
+  /// Строит «предыдущую» страницу: находит максимально правый стартовый абзац s<=currentStartBlock,
+  /// из которого страница вперёд заканчивается не позже currentStartBlock.
+  Future<_BuiltPrevPage?> _buildPrevPageStrictByBlocks(BuildContext context, int currentStartBlock) async {
+    if (currentStartBlock <= 0) return null;
 
-    final cached = _imgCache[id];
-    if (cached != null) return cached;
+    final int hi = currentStartBlock;          // верхний абзац текущей страницы
+    int lo = (hi - 1).clamp(0, _blocks.length);
 
-    final bytes = _binaries[id];
-    if (bytes == null) return null;
+    // экспоненциально расширяем окно назад, пока не найдём start, дающий end <= hi
+    int step = 1;
+    bool found = false;
+    while (true) {
+      final cand = (hi - step).clamp(0, _blocks.length);
+      final start = _Cursor(blockIndex: cand, charOffset: 0);
+      final built = await _buildNextPage(context, start);
+      if (built == null) break;
 
-    final img = await decodeUiImage(bytes);
-    _imgCache[id] = img;
-    return img;
-  }
-
-  Future<void> _pushBlockSliceAsParagraphWithMeta({
-    required BuildContext context,
-    required int blockIndex,
-    required BlockText block,
-    required int skipCharsFromStart,
-    required List<ParagraphBlock> paragraphs,
-    required List<_ParaMeta> metas,
-  }) async {
-    final s = fb2BlockRenderStyle(
-      tag: block.tag,
-      depth: block.depth,
-      baseFontSize: _baseFontSize,
-      lineHeight: _lineHeight,
-      color: Colors.black,
-    );
-
-    if (block.tag == 'empty-line') {
-      paragraphs.add(
-        ParagraphBlock(
-          inlineElements: const [],
-          textAlign: TextAlign.start,
-          paragraphSpacing: s.paragraphSpacing,
-        ),
-      );
-      metas.add(_ParaMeta(blockIndex, 0, 0));
-      return;
-    }
-
-    if (block.tag == 'image') {
-      final img = await _resolveImageForAttrs(block.attrs);
-      if (img != null) {
-        final mq = MediaQuery.of(context);
-        final safeH = mq.size.height - mq.padding.top - mq.padding.bottom;
-        final usableH = safeH - _pagePadding.vertical;
-        final maxH = (usableH * 0.9).clamp(1.0, double.infinity);
-
-        paragraphs.add(
-          ParagraphBlock(
-            inlineElements: [
-              ImageInlineElement(
-                image: img,
-                maxHeight: maxH,
-                radius: BorderRadius.circular(8),
-              ),
-            ],
-            textAlign: s.textAlign,
-            paragraphSpacing: s.paragraphSpacing,
-            enableRedLine: false,
-            firstLineIndent: 0,
-            maxWidth: s.containerWidthFactor ?? 0.92,
-            containerAlignment: s.containerAlign ?? TextAlign.center,
-          ),
-        );
+      if (!_isAfter(built.end, _Cursor(blockIndex: hi, charOffset: 0))) {
+        lo = cand;
+        found = true;
+        break;
       }
-      metas.add(_ParaMeta(blockIndex, 0, 0));
-      return;
+      if (cand == 0) break;
+      step <<= 1;
     }
 
-    final totalLen = inlineTextTotalLength(block.inlines);
-    final full = buildInlineElements(block.inlines, s.textStyle);
-    final sliced = sliceInlineElementsFromStart(full, skipCharsFromStart);
-    paragraphs.add(
-      ParagraphBlock(
-        inlineElements: sliced,
-        textAlign: s.textAlign,
-        paragraphSpacing: s.paragraphSpacing,
-        enableRedLine: skipCharsFromStart != 0 ? false : s.enableRedLine,
-        firstLineIndent: s.firstLineIndent,
-        maxWidth: s.containerWidthFactor,
-        containerAlignment: s.containerAlign,
-      ),
-    );
+    if (!found) {
+      // fallback: один абзац назад
+      final start = _Cursor(blockIndex: lo, charOffset: 0);
+      final built = await _buildNextPage(context, start);
+      if (built == null) return null;
+      if (_isAfter(built.end, _Cursor(blockIndex: hi, charOffset: 0))) return null;
+      return _BuiltPrevPage(layout: built.layout, start: start, end: built.end);
+    }
 
-    final textLenAfterSlice = (totalLen - skipCharsFromStart).clamp(0, totalLen);
-    metas.add(_ParaMeta(blockIndex, skipCharsFromStart, textLenAfterSlice));
-  }
+    // двоичный поиск максимально правого старта
+    int L = lo, R = hi - 1, best = lo;
+    while (L <= R) {
+      final mid = (L + R) >> 1;
+      final start = _Cursor(blockIndex: mid, charOffset: 0);
+      final built = await _buildNextPage(context, start);
+      if (built == null) break;
 
-  /* слово/перенос */
-  final RegExp _wordCharRe = RegExp(r'[A-Za-zА-Яа-яЁё0-9]');
-  bool _isWordCU(int cu) => _wordCharRe.hasMatch(String.fromCharCode(cu));
-
-  bool _lineEndsWithDrawnHyphen(LineLayout line) {
-    for (int i = line.elements.length - 1; i >= 0; i--) {
-      final e = line.elements[i];
-      if (e is TextInlineElement && e.text.isNotEmpty) {
-        return e.text.codeUnitAt(e.text.length - 1) == 0x2D; // '-'
+      if (!_isAfter(built.end, _Cursor(blockIndex: hi, charOffset: 0))) {
+        best = mid;
+        L = mid + 1;
+      } else {
+        R = mid - 1;
       }
     }
-    return false;
-  }
 
-  int _countParaCharsInLinesRange({
-    required List<LineLayout> lines,
-    required List<int> pidx,
-    required int paraIndex,
-    required int startLine,
-    required int endLineInclusive,
-  }) {
-    if (lines.isEmpty) return 0;
-    final s = startLine.clamp(0, lines.length - 1);
-    final e = endLineInclusive.clamp(s, lines.length - 1);
+    final start = _Cursor(blockIndex: best, charOffset: 0);
+    final built = await _buildNextPage(context, start);
+    if (built == null) return null;
+    if (_isAfter(built.end, _Cursor(blockIndex: hi, charOffset: 0))) return null;
 
-    int total = 0;
-    for (int li = s; li <= e; li++) {
-      if (pidx[li] != paraIndex) continue;
-
-      int lineChars = 0;
-      for (final el in lines[li].elements) {
-        if (el is TextInlineElement) {
-          lineChars += el.text.replaceAll('\u00AD', '').length;
-        }
-      }
-      if (_lineEndsWithDrawnHyphen(lines[li]) && lineChars > 0) lineChars -= 1;
-      if (lineChars > 0) total += lineChars;
-    }
-    return total;
-  }
-
-  String _concatParagraphText(ParagraphBlock p) {
-    final sb = StringBuffer();
-    for (final e in p.inlineElements) {
-      if (e is TextInlineElement) sb.write(e.text);
-    }
-    return sb.toString();
+    return _BuiltPrevPage(layout: built.layout, start: start, end: built.end);
   }
 
   /* ===================== build forward page ===================== */
@@ -351,9 +374,10 @@ class ReaderPagerController {
     if (start.blockIndex >= _blocks.length) return null;
 
     final mq = MediaQuery.of(context);
-    final safeWidth = mq.size.width - mq.padding.left - mq.padding.right;
-    final safeHeight = mq.size.height - mq.padding.top - mq.padding.bottom;
-    final usableWidth = safeWidth - _pagePadding.horizontal;
+    final safeWidth  = mq.size.width  - mq.padding.left - mq.padding.right;
+    final safeHeight = mq.size.height - mq.padding.top  - mq.padding.bottom;
+
+    final usableWidth  = safeWidth  - _pagePadding.horizontal;
     final usableHeight = safeHeight - _pagePadding.vertical;
 
     final paragraphs = <ParagraphBlock>[];
@@ -491,7 +515,6 @@ class ReaderPagerController {
             charOffset: meta.startOffsetInBlock + charsBeforeLastLine,
           );
 
-          // визуально отрезаем последнюю линию
           usedH -= visible[lastLine].height;
           visible = visible.sublist(0, lastLine);
         } else {
@@ -513,13 +536,14 @@ class ReaderPagerController {
       }
     }
 
-    // FIX: жёсткая гарантия продвижения (никаких end == start)
-    endCursor = _forceAdvanceAfter(endCursor, start);
-
-    // если после «среза» последней строки вдруг всё опустело — это пустая страница, пропускаем
-    if (visible.isEmpty) {
-      // позволим внешнему уровню отфильтровать отсутствие прогресса
-      if (!_isAfter(endCursor, start)) return null;
+    // строгое продвижение
+    if (!_isAfter(endCursor, start)) {
+      // попробуем хотя бы на следующий блок
+      if (start.blockIndex + 1 <= _blocks.length - 1) {
+        endCursor = _Cursor(blockIndex: start.blockIndex + 1, charOffset: 0);
+      } else {
+        return null;
+      }
     }
 
     final pageLayout = CustomTextLayout(
@@ -531,61 +555,148 @@ class ReaderPagerController {
     return _BuiltPage(pageLayout, endCursor);
   }
 
-  /* ===================== build previous page (approx) ===================== */
-  Future<_BuiltPrevPage?> _buildPrevPage(BuildContext context, _Cursor currentStart) async {
-    if (currentStart.blockIndex <= 0 && currentStart.charOffset <= 0) return null;
+  /* ===================== helpers for building content ===================== */
 
-    const int kMaxLookbackBlocks = 40;
-    final int minStart = (currentStart.blockIndex - kMaxLookbackBlocks).clamp(0, _blocks.length);
+  final RegExp _wordCharRe = RegExp(r'[A-Za-zА-Яа-яЁё0-9]');
+  bool _isWordCU(int cu) => _wordCharRe.hasMatch(String.fromCharCode(cu));
 
-    _BuiltPage? lastBefore;
-    int lastBeforeStartIdx = -1;
+  bool _lineEndsWithDrawnHyphen(LineLayout line) {
+    for (int i = line.elements.length - 1; i >= 0; i--) {
+      final e = line.elements[i];
+      if (e is TextInlineElement && e.text.isNotEmpty) {
+        return e.text.codeUnitAt(e.text.length - 1) == 0x2D; // '-'
+      }
+    }
+    return false;
+  }
 
-    for (int si = minStart; si <= currentStart.blockIndex; si++) {
-      final built = await _buildNextPage(context, _Cursor(blockIndex: si, charOffset: 0));
-      if (built == null) break;
+  int _countParaCharsInLinesRange({
+    required List<LineLayout> lines,
+    required List<int> pidx,
+    required int paraIndex,
+    required int startLine,
+    required int endLineInclusive,
+  }) {
+    if (lines.isEmpty) return 0;
+    final s = startLine.clamp(0, lines.length - 1);
+    final e = endLineInclusive.clamp(s, lines.length - 1);
 
-      if (_isAfter(built.end, currentStart)) {
-        if (lastBefore == null) {
-          return _BuiltPrevPage(
-            layout: built.layout,
-            start: _Cursor(blockIndex: si, charOffset: 0),
-            end: built.end,
-          );
-        } else {
-          return _BuiltPrevPage(
-            layout: lastBefore.layout,
-            start: _Cursor(blockIndex: lastBeforeStartIdx, charOffset: 0),
-            end: lastBefore.end,
-          );
+    int total = 0;
+    for (int li = s; li <= e; li++) {
+      if (pidx[li] != paraIndex) continue;
+
+      int lineChars = 0;
+      for (final el in lines[li].elements) {
+        if (el is TextInlineElement) {
+          lineChars += el.text.replaceAll('\u00AD', '').length;
         }
-      } else if (_cursorEq(built.end, currentStart)) {
-        return _BuiltPrevPage(
-          layout: built.layout,
-          start: _Cursor(blockIndex: si, charOffset: 0),
-          end: built.end,
+      }
+      if (_lineEndsWithDrawnHyphen(lines[li]) && lineChars > 0) lineChars -= 1;
+      if (lineChars > 0) total += lineChars;
+    }
+    return total;
+  }
+
+  String _concatParagraphText(ParagraphBlock p) {
+    final sb = StringBuffer();
+    for (final e in p.inlineElements) {
+      if (e is TextInlineElement) sb.write(e.text);
+    }
+    return sb.toString();
+  }
+
+  Future<void> _pushBlockSliceAsParagraphWithMeta({
+    required BuildContext context,
+    required int blockIndex,
+    required BlockText block,
+    required int skipCharsFromStart,
+    required List<ParagraphBlock> paragraphs,
+    required List<_ParaMeta> metas,
+  }) async {
+    final s = fb2BlockRenderStyle(
+      tag: block.tag,
+      depth: block.depth,
+      baseFontSize: _baseFontSize,
+      lineHeight: _lineHeight,
+      color: Colors.black,
+    );
+
+    if (block.tag == 'empty-line') {
+      paragraphs.add(
+        ParagraphBlock(
+          inlineElements: const [],
+          textAlign: TextAlign.start,
+          paragraphSpacing: s.paragraphSpacing,
+        ),
+      );
+      metas.add(_ParaMeta(blockIndex, 0, 0));
+      return;
+    }
+
+    if (block.tag == 'image') {
+      final img = await _resolveImageForAttrs(block.attrs);
+      if (img != null) {
+        final mq = MediaQuery.of(context);
+        final safeH = mq.size.height - mq.padding.top - mq.padding.bottom;
+        final usableH = safeH - _pagePadding.vertical;
+        final maxH = (usableH * 0.9).clamp(1.0, double.infinity);
+
+        paragraphs.add(
+          ParagraphBlock(
+            inlineElements: [
+              ImageInlineElement(
+                image: img,
+                maxHeight: maxH,
+                radius: BorderRadius.circular(8),
+              ),
+            ],
+            textAlign: s.textAlign,
+            paragraphSpacing: s.paragraphSpacing,
+            enableRedLine: false,
+            firstLineIndent: 0,
+            maxWidth: s.containerWidthFactor ?? 0.92,
+            containerAlignment: s.containerAlign ?? TextAlign.center,
+          ),
         );
       }
-
-      lastBefore = built;
-      lastBeforeStartIdx = si;
+      metas.add(_ParaMeta(blockIndex, 0, 0));
+      return;
     }
 
-    if (lastBefore != null) {
-      for (int si = currentStart.blockIndex; si >= minStart; si--) {
-        final probe = await _buildNextPage(context, _Cursor(blockIndex: si, charOffset: 0));
-        if (probe == null) break;
-        if (!_isAfter(probe.end, currentStart)) {
-          return _BuiltPrevPage(
-            layout: probe.layout,
-            start: _Cursor(blockIndex: si, charOffset: 0),
-            end: probe.end,
-          );
-        }
-      }
-    }
+    final totalLen = inlineTextTotalLength(block.inlines);
+    final full = buildInlineElements(block.inlines, s.textStyle);
+    final sliced = sliceInlineElementsFromStart(full, skipCharsFromStart);
+    paragraphs.add(
+      ParagraphBlock(
+        inlineElements: sliced,
+        textAlign: s.textAlign,
+        paragraphSpacing: s.paragraphSpacing,
+        enableRedLine: skipCharsFromStart != 0 ? false : s.enableRedLine,
+        firstLineIndent: s.firstLineIndent,
+        maxWidth: s.containerWidthFactor,
+        containerAlignment: s.containerAlign,
+      ),
+    );
 
-    return null;
+    final textLenAfterSlice = (totalLen - skipCharsFromStart).clamp(0, totalLen);
+    metas.add(_ParaMeta(blockIndex, skipCharsFromStart, textLenAfterSlice));
+  }
+
+  Future<ui.Image?> _resolveImageForAttrs(Map<String, String>? attrs) async {
+    if (attrs == null) return null;
+    final href = attrs['href'] ?? attrs['xlink:href'];
+    if (href == null || href.isEmpty) return null;
+    final id = href.startsWith('#') ? href.substring(1) : href;
+
+    final cached = _imgCache[id];
+    if (cached != null) return cached;
+
+    final bytes = _binaries[id];
+    if (bytes == null) return null;
+
+    final img = await decodeUiImage(bytes);
+    _imgCache[id] = img;
+    return img;
   }
 }
 
